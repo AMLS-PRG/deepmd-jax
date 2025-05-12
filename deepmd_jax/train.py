@@ -10,7 +10,7 @@ from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
-import os   #PRUEBA
+import os
 
 def train(
     model_type: str,
@@ -28,6 +28,7 @@ def train(
     lr: float = None,
     batch_size: int = None,
     val_batch_size_ratio: int = 4,
+    batch_size_observable: int = 10,
     compress: bool = True,
     print_every: int = 1000,
     atomic_data_prefix: str = 'atomic_dipole',
@@ -49,7 +50,8 @@ def train(
     print_loss_smoothing: int = 20,
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
-    seed: int = None
+    seed: int = None,
+    temperature: float = 330.,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -129,6 +131,8 @@ def train(
     elif model_type == 'atomic':
         labels = ['coord', 'box', atomic_data_prefix]
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
+    elif model_type == 'observables':   #New model type for observables
+        labels = ['coord', 'box', 'energy', 'force', 'observable']
     else:
         raise ValueError('model_type should be "energy", "atomic", or "dplr".')
     if type(train_data_path) == str:
@@ -206,6 +210,7 @@ def train(
         'use_2nd': tensor_2nd,
         'use_mp': mp,
         'atomic': model_type == 'atomic',
+        'observables': model_type == 'observables', #Observables model type
         'nsel': atomic_sel if model_type == 'atomic' else None,
         'out_norm': 1. if model_type != 'atomic' else train_data.get_atomic_label_scale(),
         **train_data.get_stats(rcut, getstat_bs),
@@ -255,15 +260,27 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
-    if model_type != 'atomic':
+    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn(temperature)
+    if model_type == 'observables':
+        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 'lobs_avg_raw': 0., 'iteration': 0}    
+    elif model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     
-    @partial(jax.jit, static_argnames=('static_args',))
-    def train_step(batch, variables, opt_state, state, static_args):
+    @partial(jax.jit, static_argnames=('static_args', 'observable_step'))
+    def train_step(batch, variables, opt_state, state, static_args, observable_step=False):
         r = lr_scheduler(state['iteration']) / lr
-        if model_type != 'atomic':
+        if observable_step:
+            pref = {'obs': 1}
+            (loss_obs, loss_obs_raw), grads = loss_and_grad_obs(variables,
+                                                                    batch,
+                                                                    pref,
+                                                                    static_args)
+            for key, value in zip(['lobs_avg', 'lobs_avg_raw'],
+                                [loss_obs, loss_obs_raw]):
+                state[key] = state[key] * (1-1/print_loss_smoothing) + value
+        elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
             (loss_total, (loss_e, loss_f)), grads = loss_and_grad_fn(variables,
@@ -271,7 +288,7 @@ def train(
                                                                     pref,
                                                                     static_args)
             for key, value in zip(['loss_avg', 'le_avg', 'lf_avg'],
-                                  [loss_total, loss_e, loss_f]):
+                                [loss_total, loss_e, loss_f]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value
         else:
             loss_total, grads = loss_and_grad_fn(variables,
@@ -280,7 +297,7 @@ def train(
             state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
-        state['iteration'] += 1
+        if not observable_step: state['iteration'] += 1
         return variables, opt_state, state
     
     # define validation step
@@ -304,11 +321,14 @@ def train(
         print(f'# Auto batch size = int({label_bs}/nlabels_per_frame)')
     else:
         print(f'# Batch size = {batch_size}')
-    def get_batch_train():
-        if batch_size is None:
-            return train_data.get_batch(label_bs, 'label')
+    def get_batch_train(observable_step=False):
+        if not observable_step:
+            if batch_size is None:
+                return train_data.get_batch(label_bs, 'label')
+            else:
+                return train_data.get_batch(batch_size)
         else:
-            return train_data.get_batch(batch_size)
+            return train_data.get_batch(batch_size_observable)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -354,9 +374,16 @@ def train(
                                                  opt_state,
                                                  state,
                                                  static_args)
-        if iteration % print_every == 0:
-            print_step()
-            tic = time.time()
+        # observable train step
+        batch, type_count, lattice_args = get_batch_train(observable_step=True)
+        static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                                     'lattice': lattice_args})
+        variables, opt_state, state = train_step(batch,
+                                                 variables,
+                                                 opt_state,
+                                                 state,
+                                                 static_args,
+                                                 observable_step=True)
 
     # compress, save, and finish
     if compress:

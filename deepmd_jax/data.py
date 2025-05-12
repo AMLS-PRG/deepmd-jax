@@ -24,10 +24,10 @@ class DPDataset():
             self.natoms = len(self.type)
             self.nframes = len(self.data['coord'])
             self.pointer = self.nframes
-            self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type)+1)])
+            self.type_count = np.array([(self.type == i).sum() for i in range(max(self.type)+1)])  # A list with the number of atoms of each type
             self.ntypes = len(self.type_count)
             self.valid_types = np.arange(self.ntypes)
-            self.nsel = params.get('atomic_sel', None)
+            self.nsel = params.get('atomic_sel', None)  # Atomic type case
             if self.nsel is not None:
                 self.nsel = [i for i in self.nsel if i in range(self.ntypes)]
             if any(['atomic' in l for l in labels]):
