@@ -18,6 +18,7 @@ def train(
     train_data_path: Union[str, List[str]],
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
+    progress_path: str = 'progress.txt',
     step: int = 1000000,
     mp: bool = False,
     atomic_sel: List[int] = None,
@@ -36,6 +37,8 @@ def train(
     l_pref_e: float = 1,
     s_pref_f: float = 1000,
     l_pref_f: float = 1,
+    s_pref_obs: float = 0.01,
+    l_pref_obs: float = 1,
     dplr_wannier_model_path: str = None,
     dplr_q_atoms: List[float] = None,
     dplr_q_wc: List[float] = None,
@@ -258,14 +261,15 @@ def train(
     def train_step(batch, variables, opt_state, state, static_args, observable_step=False):
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
-            pref = {'obs': 1}
+            pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
             (loss_obs, loss_obs_raw), grads = loss_and_grad_obs(variables,
                                                                     batch,
                                                                     pref,
                                                                     static_args)
             for key, value in zip(['lobs_avg', 'lobs_avg_raw'],
                                 [loss_obs, loss_obs_raw]):
-                state[key] = state[key] * (1-1/print_loss_smoothing) + value
+                state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
+                state['loss_avg'] += loss_obs * 1/print_loss_smoothing
         elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
@@ -275,12 +279,12 @@ def train(
                                                                     static_args)
             for key, value in zip(['loss_avg', 'le_avg', 'lf_avg'],
                                 [loss_total, loss_e, loss_f]):
-                state[key] = state[key] * (1-1/print_loss_smoothing) + value
+                state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
         else:
             loss_total, grads = loss_and_grad_fn(variables,
                                                  batch,
                                                  static_args)
-            state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total
+            state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total * 1/print_loss_smoothing
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
         if not observable_step: state['iteration'] += 1
@@ -307,6 +311,8 @@ def train(
         print(f'# Auto batch size = int({label_bs}/nlabels_per_frame)')
     else:
         print(f'# Batch size = {batch_size}')
+    if model_type == 'observables':
+        print(f'# Observable loss batch size = {batch_size_observable}')
     def get_batch_train(observable_step=False):
         if not observable_step:
             if batch_size is None:
@@ -352,6 +358,17 @@ def train(
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
+        if iteration % print_every == 0 and model_type == 'observables':
+            state_keys = ['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw']
+            state_values = [state[key] for key in state_keys]
+            state_keys[-1] = 'lobs_avg'  # we just want to print the actual observable error (without the prefix)
+            mode = 'w' if iteration == 0 else 'a'
+            with open(progress_path, mode) as file:
+                if iteration == 0: file.write('  '.join(f'{key:>12}' for key in state_keys) + '\n')
+                iter_str = f'{int(state_values[0]):>12}  '
+                loss_str = '  '.join(f'{value:>12.5e}' for value in state_values[1:])
+                file.write(iter_str + loss_str + '\n')
+
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                      'lattice': lattice_args})
