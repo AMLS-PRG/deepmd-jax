@@ -5,20 +5,28 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset, distribution_plot
 from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
 import os
+from matplotlib.cm import get_cmap
+from matplotlib.colors import LinearSegmentedColormap
 
 def train(
     model_type: str,
     rcut: float,
     train_data_path: Union[str, List[str]],
+    train_data_path_obs: Union[str, List[str]] = None,
+    ess_data_path: Union[str, List[str]] = None,
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
-    progress_path: str = 'progress.txt',
+    progress_path: str = 'progress.out',
+    distribution_path: str = 'distribution.out',
+    plot_path: str = 'distribution.png',
+    print_distribution: bool = False,
+    plot_distribution: bool = False,
     step: int = 1000000,
     mp: bool = False,
     atomic_sel: List[int] = None,
@@ -26,12 +34,14 @@ def train(
     embed_mp_widths: List[int] = [64,64,64],
     fit_widths: List[int] = None,
     axis_neurons: int=12,
-    lr: float = None,
+    lr: float = None, #0.002 for energy, 0.01 for atomic
     batch_size: int = None,
     val_batch_size_ratio: int = 4,
-    batch_size_observable: int = 10,
+    batch_size_observable: int = 8,
+    batch_size_ess: int = 8,
     compress: bool = True,
     print_every: int = 1000,
+    plot_every: int = 100000,  #Just for observables
     atomic_data_prefix: str = 'atomic_dipole',
     s_pref_e: float = 0.02,
     l_pref_e: float = 1,
@@ -55,6 +65,7 @@ def train(
     compress_r_min: float = 0.6,
     seed: int = None,
     temperature: float = 330.,
+    target_observable: Union[float, str, None] = None,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -135,7 +146,7 @@ def train(
         labels = ['coord', 'box', atomic_data_prefix]
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
     elif model_type == 'observables':   #New model type for observables
-        labels = ['coord', 'box', 'energy', 'force', 'observable']
+        labels = ['coord', 'box', 'energy', 'force']
     else:
         raise ValueError('model_type should be "energy", "atomic", or "dplr".')
     if type(train_data_path) == str:
@@ -146,6 +157,18 @@ def train(
                            labels,
                            {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
+    if model_type == 'observables':
+        if train_data_path_obs is None: train_data_path_obs = train_data_path
+        elif type(train_data_path_obs) == str:
+            train_data_path_obs = [train_data_path_obs]
+        else:
+            train_data_path_obs = [[path] for path in train_data_path_obs]
+        labels_obs = labels + ['observable']
+        labels_obs = [item for item in labels_obs if item != 'force']
+        train_data_obs = DPDataset(train_data_path_obs,
+                                   labels_obs,
+                                   {'atomic_sel':atomic_sel})
+        train_data_obs.compute_lattice_candidate(rcut)
     use_val_data = val_data_path is not None
     if use_val_data:
         if type(val_data_path) == str:
@@ -158,6 +181,13 @@ def train(
         val_data.compute_lattice_candidate(rcut)
     else:
         val_data = None
+    if ess_data_path is not None:
+        ess_data_path = [ess_data_path]
+        labels_ess = [item for item in labels if item != 'force']
+        ess_data = DPDataset(ess_data_path,
+                             labels_ess,
+                             {'atomic_sel':atomic_sel})
+        ess_data.compute_lattice_candidate(rcut)
 
     # for dplr, convert dataset to short-range
     if model_type == 'dplr':
@@ -249,9 +279,16 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
-    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn(temperature)
+    if target_observable is None and model_type == 'observables':
+        raise ValueError('Must provide target_observable for model_type "observables".')
+    if isinstance(target_observable, str):
+        target_observable = np.load(target_observable)
+
+    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn(target_observable, temperature)
+    weights = model.get_weights(temperature)
     if model_type == 'observables':
-        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 'lobs_avg_raw': 0., 'iteration': 0}    
+        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 
+                 'lobs_avg_raw': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. , 'iteration': 0}    
     elif model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
@@ -261,15 +298,20 @@ def train(
     def train_step(batch, variables, opt_state, state, static_args, observable_step=False):
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
-            pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
-            (loss_obs, loss_obs_raw), grads = loss_and_grad_obs(variables,
-                                                                    batch,
-                                                                    pref,
-                                                                    static_args)
+            pref = {'e': s_pref_e*r + l_pref_e*(1-r),
+                    'obs': s_pref_obs*r + l_pref_obs*(1-r)}
+            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
+                                                                                                  batch,
+                                                                                                  pref,
+                                                                                                  static_args)
             for key, value in zip(['lobs_avg', 'lobs_avg_raw'],
-                                [loss_obs, loss_obs_raw]):
+                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
-                state['loss_avg'] += loss_obs * 1/print_loss_smoothing
+            state['obs_term_avg'] = obs_avg
+            state['obs_mean'] = np.mean(obs_batch, axis=0)
+            state['logweights'] = logweights
+            weights = jnp.exp(logweights)
+            state['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
         elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
@@ -278,7 +320,7 @@ def train(
                                                                     pref,
                                                                     static_args)
             for key, value in zip(['loss_avg', 'le_avg', 'lf_avg'],
-                                [loss_total, loss_e, loss_f]):
+                                [jnp.sqrt(loss_total), jnp.sqrt(loss_e), jnp.sqrt(loss_f)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
         else:
             loss_total, grads = loss_and_grad_fn(variables,
@@ -320,7 +362,7 @@ def train(
             else:
                 return train_data.get_batch(batch_size)
         else:
-            return train_data.get_batch(batch_size_observable)
+            return train_data_obs.get_batch(batch_size_observable)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -329,6 +371,8 @@ def train(
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
+    def get_batch_ess():
+        return ess_data.get_batch(batch_size_ess)
         
     # define print step
     def print_step():
@@ -347,6 +391,48 @@ def train(
         line += f' Time {time.time() - tic:.2f}s'
         print(line)
 
+    # define print step in progress file
+    def print_progress(state_keys, **kwargs):
+        state_values = [state[key] for key in state_keys]
+        for count in range(len(state_values)):
+            state_values[count] = np.max(state_values[count])
+        kwarg_values = [kwargs[key] for key in kwargs.keys()]
+        mode = 'w' if iteration == 0 else 'a'
+        with open(progress_path, mode) as file:
+            if iteration == 0:
+                if len(state_keys) > 4 and state_keys[4] == 'lobs_avg_raw': state_keys[4] = 'lobs_avg'
+                keys = state_keys + list(kwargs.keys())
+                file.write('  '.join(f'{key:>12}' for key in keys) + '\n')
+            iter_str = f'{int(state_values[0]):>12}  '
+            loss_str = '  '.join(f'{value:>12.4e}' for value in state_values[1:])
+            kwarg_str = '  ' + '  '.join(f'{value:>12.4e}' for value in kwarg_values)
+            file.write(iter_str + loss_str + kwarg_str + '\n')
+
+    def ESS(variables, batch, static_args):
+        weights = model.get_weights(temperature)
+        logweights = weights(variables, batch, static_args)
+        logweights -= jnp.amax(logweights)
+        weights = jnp.exp(logweights)
+        ESS = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+        return ESS
+    
+    def print_distr():
+        obs_total = []
+        logweights_fullset = []
+        for i in range(int(train_data_obs.nframes/batch_size_observable)):
+            _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
+            obs = _batch['observable'].reshape(len(_batch['energy']), -1)
+            obs_total = np.append(obs_total, np.max(obs, axis=1))
+            pred_logweights = weights(variables, _batch, static_args)
+            logweights_fullset = np.append(logweights_fullset, pred_logweights)
+        logweights_fullset -= logweights_fullset.max()
+        weights_fullset = np.exp(logweights_fullset)
+        table = np.column_stack((obs_total, weights_fullset))
+        with open(distribution_path, 'w') as f:
+            f.write('Observable  Weight\n')
+            for line in table:
+                f.write(f'{line[0]:.5f} {line[1]:.5e}\n')
+    
     # training loop
     tic = time.time()
     for iteration in range(int(step+1)):
@@ -358,16 +444,16 @@ def train(
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
-        if iteration % print_every == 0 and model_type == 'observables':
-            state_keys = ['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw']
-            state_values = [state[key] for key in state_keys]
-            state_keys[-1] = 'lobs_avg'  # we just want to print the actual observable error (without the prefix)
-            mode = 'w' if iteration == 0 else 'a'
-            with open(progress_path, mode) as file:
-                if iteration == 0: file.write('  '.join(f'{key:>12}' for key in state_keys) + '\n')
-                iter_str = f'{int(state_values[0]):>12}  '
-                loss_str = '  '.join(f'{value:>12.5e}' for value in state_values[1:])
-                file.write(iter_str + loss_str + '\n')
+        if iteration % print_every == 0:
+            if model_type == 'observables':
+                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'obs_term_avg', 'obs_mean', 'ESS'])
+            else:
+                if ess_data_path is not None:
+                    batch_ess, _, _ = get_batch_ess()
+                    ess = ESS(variables, batch_ess, static_args)
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ESS=ess)
+                else:
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'])
 
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
@@ -377,16 +463,50 @@ def train(
                                                  opt_state,
                                                  state,
                                                  static_args)
-        # observable train step
-        batch, type_count, lattice_args = get_batch_train(observable_step=True)
-        static_args = nn.FrozenDict({'type_count': tuple(type_count),
-                                     'lattice': lattice_args})
-        variables, opt_state, state = train_step(batch,
-                                                 variables,
-                                                 opt_state,
-                                                 state,
-                                                 static_args,
-                                                 observable_step=True)
+        
+        # if iteration % print_every == 0:
+        #     print_step()
+        #     tic = time.time()
+        
+        if model_type == 'observables':
+            # observable train step
+            batch, type_count, lattice_args = get_batch_train(observable_step=True)
+            static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                                        'lattice': lattice_args})
+            variables, opt_state, state = train_step(batch,
+                                                    variables,
+                                                    opt_state,
+                                                    state,
+                                                    static_args,
+                                                    observable_step=True) 
+
+            # plot observable distribution
+            if plot_distribution and iteration % plot_every == 0:
+                if iteration == 0:
+                    fig = distribution_plot()
+                    fig.reference(train_data_obs.subsets[0].data['observable'], label='Reference')
+                    colors = ["yellow", "orange", "red"]
+                    cmap = LinearSegmentedColormap.from_list("my_colormap", colors)
+                    #cmap = get_cmap('Greens')
+                    color_grad = iter([cmap(i) for i in np.linspace(0., 1., int(step/plot_every))])
+                else:
+                    obs_fullset = []
+                    logweights_fullset = []
+                    for i in range(int(train_data_obs.nframes/batch_size_observable)):
+                        _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
+                        obs_fullset = np.append(obs_fullset, _batch['observable'])
+                        pred_logweights = weights(variables, _batch, static_args)
+                        logweights_fullset = np.append(logweights_fullset, pred_logweights)
+                    logweights_fullset -= logweights_fullset.max()
+                    weights_fullset = np.exp(logweights_fullset)
+                    fig.add_histogram(obs_fullset, weights_fullset, label=f'Iteration {iteration:,}', color=next(color_grad))
+
+    if plot_distribution: fig.savefig(plot_path)
+
+    # print observable distribution
+    if model_type == 'observables' and print_distribution:
+        print('# Printing observable distribution to', distribution_path)
+        print_distr()
 
     # compress, save, and finish
     if compress:
