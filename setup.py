@@ -16,6 +16,7 @@ setup(
         'matplotlib',
         'gpustat',
         'ipykernel',
+        'seaborn',
     ],
     author='Ruiqi Gao',
     author_email='ruiqigao@princeton.edu',
