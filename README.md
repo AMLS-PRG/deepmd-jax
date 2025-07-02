@@ -1,4 +1,4 @@
-# DeepMD-jax
+# DeepMD-jax test
 
 Welcome to **DeepMD-jax v0.2**!
 
