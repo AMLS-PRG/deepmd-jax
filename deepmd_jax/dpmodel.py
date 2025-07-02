@@ -94,11 +94,6 @@ class DPModel(nn.Module):
         (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_nm)
         return pred, -g
     
-    def observable(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
-        pred, _ = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
-        print('HERE')
-        return pred
-    
     def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)[0]
         coord_ref = [c for i,c in enumerate(split(coord_N3, static_args['type_count'])) if i in self.params['nsel']]
@@ -122,18 +117,34 @@ class DPModel(nn.Module):
                 return ((batch_data['atomic'] - pred)**2).mean()
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad
-    
-    def get_observable_loss_fn(self, temp):
+
+    def get_observable_loss_fn(self, target_observable, temperature):
         vmap_energy = vmap(self.energy, (None, 0, 0, None))
         def loss_obs(variables, batch_data, pref, static_args):
             e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
             kb = 8.617333262e-5
-            beta = 1 / (kb * temp)
-            logweights = - beta * (batch_data['energy'] - e)
-            logweights -= jnp.amax(logweights)  # for numerical stability, we displace the exponents of the weights
-            obs_ev = jnp.sum(batch_data['observable'] * jnp.exp(logweights)) / jnp.sum(jnp.exp(logweights)) # observable expected value from data
-            obs_ref = 1   # 1 g/cm^3 Density
-            lobs = (obs_ev - obs_ref)**2
-            return pref['obs']*lobs, lobs
+            beta = 1 / (kb * temperature)
+            logweights = - beta * (e - batch_data['energy'])
+            logweights -= jnp.amax(logweights).flatten()  # for numerical stability, we displace the exponents of the weights
+            weights = jnp.exp(logweights)
+            observable = batch_data['observable']
+            if len(observable.shape) == 1:
+                observable = observable[:, None]  # ensure observable is 2D
+            obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable expected value from data
+            lobs = jnp.mean((obs_avg - target_observable)**2)
+            le = ((e - batch_data['energy'])**2).mean() / (batch_data['coord'].shape[1])**2
+            return pref['e']*le + pref['obs']*lobs, (lobs, obs_avg, observable, logweights)
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
+    
+    def get_weights(self, temperature):
+        vmap_energy = vmap(self.energy, (None, 0, 0, None))
+        def weights(variables, batch_data, static_args):
+            e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
+            kb = 8.617333262e-5
+            beta = 1 / (kb * temperature)
+            logweights = - beta * (e - batch_data['energy'])
+            #logweights -= jnp.amax(logweights)
+            #weights = jnp.exp(logweights)
+            return logweights
+        return weights

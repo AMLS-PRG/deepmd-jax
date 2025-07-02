@@ -5,6 +5,10 @@ import numpy as np
 import flax.linen as nn
 import pickle, os
 from scipy.interpolate import PPoly, BPoly
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+import seaborn as sns
 
 # Global system settings
 def initialize():
@@ -361,3 +365,55 @@ def get_mask_by_device(type_count):
     # ensure mask is sharded by device
     sharding = jax.sharding.PositionalSharding(jax.devices())
     return jax.lax.with_sharding_constraint(mask, sharding)
+
+class distribution_plot(Figure):
+    def __init__(self, *args, **kwargs):
+        super().__init__(figsize=(10, 6), *args, **kwargs)
+        self.ax = self.add_subplot(111)
+        self.ax.set_xlabel(r'Density (g/cm^3)', size=12)
+        self.ax.set_ylabel(r'Probability Density', size=12)
+        self.ax.set_title(r'Density Distribution', size=14)
+
+    def reference(self, values=None, path=None, **kwargs):
+        if values is None and path is None: raise ValueError('Either values or path must be provided.')
+        elif values is not None:
+            if path is not None: print('# Warning: both path and data provided, using data.')
+        else:
+            def load_data(path):
+                if not os.path.exists(path): raise FileNotFoundError(f'File not found: {path}')
+                try:
+                    values = np.loadtxt(path)
+                    return values
+                except Exception as e_txt:
+                    try:
+                        values = np.load(path, allow_pickle=True)
+                        return values
+                    except Exception as e_bin:
+                        raise IOError(
+                            f"Could not read the file as txt or binary.\n"
+                            f"Text load error: {e_txt}\n"
+                            f"Binary load error: {e_bin}"
+                        )
+            values = load_data(path)
+        defaults = {'color': 'royalblue', 'lw': 2, 'label': 'Reference'}
+        sns.kdeplot(values, common_norm=True, ax=self.ax, **{**defaults, **kwargs})
+    
+    def add_smooth(self, values, weights, **kwargs):
+        defaults = {'color': 'green', 'lw': 2}
+        nonzero_weights = np.sum(weights > 1e-10)
+        if nonzero_weights == 1:
+            x0 = values[weights > 1e-10]
+            x = np.linspace(min(values), max(values), 200)
+            delta = norm(loc=x0, scale=0.015).pdf(x)
+            self.ax.plot(x, delta, **{**defaults, **kwargs})
+        else:
+            sns.kdeplot(x=values, weights=weights, common_norm=True, ax=self.ax, **{**defaults, **kwargs})
+        self.ax.legend()
+
+    def add_histogram(self, values, weights=None, **kwargs):
+        defaults = {'color': 'orange', 'lw': 2, 'alpha': 0.75}
+        if weights is None:
+            self.ax.hist(values, bins=50, density=True, **{**defaults, **kwargs})
+        else:
+            self.ax.hist(values, bins=50, weights=weights, density=True, **{**defaults, **kwargs})
+        self.ax.legend()
