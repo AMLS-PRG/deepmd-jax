@@ -988,12 +988,14 @@ class TrajDump:
 
         self.write_settings = kwargs
 
-    def write(self, positions, cell):
+    def write(self, positions, velocities, cell):
         self.atoms.set_positions(positions)
+        if self.vel: self.atoms.set_velocities(velocities)
         self.atoms.set_cell(cell)
         io.write(
             self.fname,
             self.atoms,
+            append=True,
             **self.write_settings,
         )
 
@@ -1073,7 +1075,7 @@ class TrajDumpSimulation(Simulation):
         self._print_report()
         self._is_initial_state = False
 
-    def run(self, steps, dump_list: List[TrajDump]):
+    def run(self, steps, dump: TrajDump):
         """
         Run the simulation for a number of steps.
         """
@@ -1122,10 +1124,9 @@ class TrajDumpSimulation(Simulation):
             if self.step % self.report_interval == 0 or remaining_steps == 0:
                 self._print_report()
 
-            for dump in dump_list:
-                if self.step % dump.interval == 0 or remaining_steps == 0:
-                    cell = np.concatenate([np.array(box_traj[-1]), [90, 90, 90]])
-                    dump.write(pos_traj[-1] if not dump.vel else vel_traj[-1], cell)
+            if self.step % dump.interval == 0 or remaining_steps == 0:
+                cell = np.concatenate([np.array(box_traj[-1]), [90, 90, 90]])
+                dump.write(pos_traj[-1], vel_traj[-1], cell)
 
         self._print_run_profile(steps, time() - self._tic_of_this_run)
         self._keep_nbr_or_lattice_up_to_date()
