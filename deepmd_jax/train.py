@@ -314,12 +314,12 @@ def train(
         if observable_step:
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'obs': s_pref_obs*r + l_pref_obs*(1-r)}
-            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
+            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights, loss_energy_obs)), grads = loss_and_grad_obs(variables,
                                                                                                   batch,
                                                                                                   pref,
                                                                                                   static_args)
-            for key, value in zip(['lobs_avg', 'lobs_avg_raw'],
-                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw)]):
+            for key, value in zip(['lobs_avg', 'lobs_avg_raw', 'lobs_e'],
+                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw), jnp.sqrt(loss_energy_obs)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
             state['obs_term_avg'] = obs_avg
             state['obs_mean'] = np.mean(obs_batch, axis=0)
@@ -460,7 +460,7 @@ def train(
                 loss_val.append(val_step(v_batch, variables, static_args))
         if iteration % print_every == 0:
             if model_type == 'observables':
-                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'obs_term_avg', 'obs_mean', 'ESS'])
+                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'lobs_e', 'obs_term_avg', 'obs_mean', 'ESS'])
             else:
                 if ess_data_path is not None:
                     batch_ess, _, _ = get_batch_ess()
@@ -482,7 +482,7 @@ def train(
         #     print_step()
         #     tic = time.time()
         
-        if model_type == 'observables' and iteration % 5 == 0:
+        if model_type == 'observables':
             # observable train step
             batch, type_count, lattice_args = get_batch_train(observable_step=True)
             static_args = nn.FrozenDict({'type_count': tuple(type_count),
