@@ -482,7 +482,7 @@ def train(
         #     print_step()
         #     tic = time.time()
         
-        if model_type == 'observables':
+        if model_type == 'observables' and iteration % 5 == 0:
             # observable train step
             batch, type_count, lattice_args = get_batch_train(observable_step=True)
             static_args = nn.FrozenDict({'type_count': tuple(type_count),
