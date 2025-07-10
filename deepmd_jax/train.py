@@ -47,8 +47,10 @@ def train(
     l_pref_e: float = 1,
     s_pref_f: float = 1000,
     l_pref_f: float = 1,
-    s_pref_obs: float = 0.01,
-    l_pref_obs: float = 1,
+    s_pref_obs: float = 0.005,
+    l_pref_obs: float = 0.1,
+    s_pref_eobs: float = 0.02,
+    l_pref_eobs: float = 1,
     dplr_wannier_model_path: str = None,
     dplr_q_atoms: List[float] = None,
     dplr_q_wc: List[float] = None,
@@ -302,7 +304,8 @@ def train(
     weights = model.get_weights(temperature)
     if model_type == 'observables':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 
-                 'lobs_avg_raw': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. , 'iteration': 0}    
+                 'lobs_avg_raw': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'lobs_e': 0.,
+                 'logweights': [0.], 'ESS': 1. , 'iteration': 0}    
     elif model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
@@ -312,14 +315,14 @@ def train(
     def train_step(batch, variables, opt_state, state, static_args, observable_step=False):
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
-            pref = {'e': s_pref_e*r + l_pref_e*(1-r),
+            pref = {'e': s_pref_eobs*r + l_pref_eobs*(1-r),
                     'obs': s_pref_obs*r + l_pref_obs*(1-r)}
-            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
+            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights, loss_energy_obs)), grads = loss_and_grad_obs(variables,
                                                                                                   batch,
                                                                                                   pref,
                                                                                                   static_args)
-            for key, value in zip(['lobs_avg', 'lobs_avg_raw'],
-                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw)]):
+            for key, value in zip(['lobs_avg', 'lobs_avg_raw', 'lobs_e'],
+                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw), jnp.sqrt(loss_energy_obs)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
             state['obs_term_avg'] = obs_avg
             state['obs_mean'] = np.mean(obs_batch, axis=0)
@@ -460,7 +463,7 @@ def train(
                 loss_val.append(val_step(v_batch, variables, static_args))
         if iteration % print_every == 0:
             if model_type == 'observables':
-                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'obs_term_avg', 'obs_mean', 'ESS'])
+                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'lobs_e', 'obs_term_avg', 'obs_mean', 'ESS'])
             else:
                 if ess_data_path is not None:
                     batch_ess, _, _ = get_batch_ess()
