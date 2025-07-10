@@ -125,7 +125,7 @@ class DPModel(nn.Module):
             kb = 8.617333262e-5
             beta = 1 / (kb * temperature)
             logweights = - beta * (e - batch_data['energy'])
-            logweights -= jnp.amax(logweights).flatten()  # for numerical stability, we displace the exponents of the weights
+            logweights -= jnp.amax(logweights)  # for numerical stability, we displace the exponents of the weights
             weights = jnp.exp(logweights)
             observable = batch_data['observable']
             if len(observable.shape) == 1:
@@ -133,7 +133,9 @@ class DPModel(nn.Module):
             obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable expected value from data
             lobs = jnp.mean((obs_avg - target_observable)**2)
             le = ((e - batch_data['energy'])**2).mean() / (batch_data['coord'].shape[1])**2
-            return pref['e']*le + pref['obs']*lobs, (lobs, obs_avg, observable, logweights, le)
+            ess = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+            less = (1 - ess/len(weights))**2  # ESS loss, penalizing deviation from N
+            return pref['e']*le + pref['obs']*lobs + pref['ess']*less, (lobs, obs_avg, observable, logweights, le, ess)
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
     

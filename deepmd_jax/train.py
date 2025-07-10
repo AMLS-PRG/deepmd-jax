@@ -51,6 +51,7 @@ def train(
     l_pref_obs: float = 0.1,
     s_pref_eobs: float = 0.02,
     l_pref_eobs: float = 1,
+    pref_ess: float = 1.0,
     dplr_wannier_model_path: str = None,
     dplr_q_atoms: List[float] = None,
     dplr_q_wc: List[float] = None,
@@ -316,19 +317,19 @@ def train(
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
             pref = {'e': s_pref_eobs*r + l_pref_eobs*(1-r),
-                    'obs': s_pref_obs*r + l_pref_obs*(1-r)}
-            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights, loss_energy_obs)), grads = loss_and_grad_obs(variables,
-                                                                                                  batch,
-                                                                                                  pref,
-                                                                                                  static_args)
+                    'obs': s_pref_obs*r + l_pref_obs*(1-r),
+                    'ess': pref_ess}
+            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights, loss_energy_obs, ess)), grads = loss_and_grad_obs(variables,
+                                                                                                                        batch,
+                                                                                                                        pref,
+                                                                                                                        static_args)
             for key, value in zip(['lobs_avg', 'lobs_avg_raw', 'lobs_e'],
                                 [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw), jnp.sqrt(loss_energy_obs)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
             state['obs_term_avg'] = obs_avg
             state['obs_mean'] = np.mean(obs_batch, axis=0)
             state['logweights'] = logweights
-            weights = jnp.exp(logweights)
-            state['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+            state['ESS'] = ess
         elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
