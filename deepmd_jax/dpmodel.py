@@ -124,7 +124,7 @@ class DPModel(nn.Module):
             kb = 8.617333262e-5
             beta = 1 / (kb * temperature)
             logweights = - beta * (e - batch_data['energy'])
-            logweights -= jnp.amax(logweights).flatten()  # for numerical stability, we displace the exponents of the weights
+            logweights -= jnp.amax(logweights)  # for numerical stability, we displace the exponents of the weights
             weights = jnp.exp(logweights)
             observable = batch_data['observable']
             if len(observable.shape) == 1:
