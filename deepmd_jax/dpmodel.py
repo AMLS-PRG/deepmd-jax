@@ -131,8 +131,7 @@ class DPModel(nn.Module):
                 observable = observable[:, None]  # ensure observable is 2D
             obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable expected value from data
             lobs = jnp.mean((obs_avg - target_observable)**2)
-            le = ((e - batch_data['energy'])**2).mean() / (batch_data['coord'].shape[1])**2
-            return pref['e']*le + pref['obs']*lobs, (lobs, obs_avg, observable, logweights, le)
+            return pref['obs']*lobs, (lobs, obs_avg, observable, logweights)
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
     
