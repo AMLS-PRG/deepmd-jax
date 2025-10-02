@@ -64,17 +64,20 @@ def train(
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
     seed: int = None,
-    temperature: float = 330.,
+    temperature: float = 300,
     target_observable: Union[float, str, None] = None,
 ):
     '''
         Entry point for training deepmd-jax models.
+
         Input arguments:
             model_type: 'energy' (force field), 'atomic' (e,g. Deep Wannier), 'dplr' (long-range)
             rcut: cutoff radius (Angstrom) for the model.
             save_path: path to save the trained model.
+            progress_path: path to save variables from the training progress.
             train_data: path to training data (str) or list of paths to training data (List[str]).
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
+            ess_data: path to data for computing effective sample size (str) or list of paths to such data (List[str]).
             step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
             mp: whether to use message passing model for more accuracy at a higher cost.
             atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic'.
@@ -85,6 +88,7 @@ def train(
             lr: learning rate at start. If None, default values (0.002 for 'energy' and 0.01 for 'atomic') is used.
             batch_size: training batch size in number of frames. If None, will be automatically determined by label_bs.
             val_batch_size_ratio: validation batch size / batch_size. Increase for stabler validation loss.
+            batch_size_ess: batch size for computing effective sample size. Only used when ess_data_path is provided.
             compress: whether to compress the model after training for faster inference.
             print_every: interval for printing loss and validation.
             atomic_data_prefix: prefix for .npy label files when model_type == 'atomic'.
@@ -106,6 +110,16 @@ def train(
             print_loss_smoothing: smoothing factor for loss printing.
             compress_Ngrids: Number of intervals used in compression.
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
+
+        Observables model specific input arguments:
+            distribution_path: path to save the final values of the observable and weights for each configuration (only used when print_distribution = True).
+            plot_path: path to save the on-the-fly observable distribution plot (only used when print_plot = True).
+            plot_every: interval for updating the observable distribution plot (only used when print_plot = True).
+            batch_size_observable: training batch size for observable loss in number of frames.
+            s_pref_obs: starting prefactor for observable loss.
+            l_pref_obs: limit prefactor for observable loss.
+            temperature: Temperature of the system (K). Used in the reweighting of observables.
+            target_observable: Target value of the observable to be learned. Can be a float or a path to a .npy file containing (single or multiple) values for each configuration in different lines.
     '''
     
     TIC = time.time()
@@ -302,8 +316,8 @@ def train(
     weights = model.get_weights(temperature)
     if model_type == 'observables':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 
-                 'lobs_avg_raw': 0., 'obs_term_avg': 0., 'obs_mean': 0.,
-                 'logweights': [0.], 'ESS': 1. , 'iteration': 0}    
+                 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 
+                 'ESS': 1. , 'iteration': 0}    
     elif model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
@@ -318,7 +332,7 @@ def train(
                                                                                                   batch,
                                                                                                   pref,
                                                                                                   static_args)
-            for key, value in zip(['lobs_avg', 'lobs_avg_raw', 'lobs_e'],
+            for key, value in zip(['lobs_avg', 'lobs_e'],
                                 [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw)]):
                 state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
             state['obs_term_avg'] = obs_avg
@@ -387,34 +401,19 @@ def train(
         return ret
     def get_batch_ess():
         return ess_data.get_batch(batch_size_ess)
-        
-    # define print step
-    def print_step():
-        beta_smoothing = print_loss_smoothing * (1 - (1-1/print_loss_smoothing)**(iteration+1))
-        line = f'Iter {iteration:7d}'
-        line += f' L {(state["loss_avg"] / beta_smoothing) ** 0.5:7.5f}'
-        if model_type != 'atomic':
-            line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
-            line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
-        if use_val_data:
-            if model_type != 'atomic':
-                line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
-                line += f' LFval {np.array([l[1] for l in loss_val]).mean() ** 0.5:7.5f}'
-            else:
-                line += f' Lval {np.array(loss_val).mean() ** 0.5:7.5f}'
-        line += f' Time {time.time() - tic:.2f}s'
-        print(line)
 
     # define print step in progress file
-    def print_progress(state_keys, **kwargs):
+    def print_progress(state_keys: List, validation=None, **kwargs):
         state_values = [state[key] for key in state_keys]
         for count in range(len(state_values)):
             state_values[count] = np.max(state_values[count])
         kwarg_values = [kwargs[key] for key in kwargs.keys()]
         mode = 'w' if iteration == 0 else 'a'
+        if validation is not None:
+            state_keys += ['le_val', 'lf_val']
+            state_values += validation
         with open(progress_path, mode) as file:
             if iteration == 0:
-                if len(state_keys) > 4 and state_keys[4] == 'lobs_avg_raw': state_keys[4] = 'lobs_avg'
                 keys = state_keys + list(kwargs.keys())
                 file.write('  '.join(f'{key:>12}' for key in keys) + '\n')
             iter_str = f'{int(state_values[0]):>12}  '
@@ -450,6 +449,7 @@ def train(
     # training loop
     tic = time.time()
     for iteration in range(int(step+1)):
+        # print progress
         if use_val_data and iteration % print_every == 0:
             val_batch = get_batch_val()
             loss_val = []
@@ -458,9 +458,13 @@ def train(
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
+            validation = [sum(col) / len(col) for col in zip(*loss_val)]
         if iteration % print_every == 0:
             if model_type == 'observables':
-                print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg_raw', 'obs_term_avg', 'obs_mean', 'ESS'])
+                if use_val_data:
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'], validation)
+                else:
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'])
             else:
                 if ess_data_path is not None:
                     batch_ess, _, _ = get_batch_ess()
@@ -469,6 +473,7 @@ def train(
                 else:
                     print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'])
 
+        # training step part 1: energy and force
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                      'lattice': lattice_args})
@@ -477,11 +482,7 @@ def train(
                                                  opt_state,
                                                  state,
                                                  static_args)
-        
-        # if iteration % print_every == 0:
-        #     print_step()
-        #     tic = time.time()
-        
+        # training step part 2: observables
         if model_type == 'observables':
             # observable train step
             batch, type_count, lattice_args = get_batch_train(observable_step=True)
