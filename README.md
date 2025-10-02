@@ -135,7 +135,7 @@ trajectory = sim.run(100000)
 ### Running with ASE
 
 An ASE calculator is provided and can be used to run energy minimizations or molecular dynamics. This is a minimal example:
-```
+```python
 from deepmd_jax.md import DPJaxCalculator
 from ase import Atoms
 from ase.md.langevin import Langevin
