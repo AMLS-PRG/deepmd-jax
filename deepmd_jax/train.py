@@ -318,9 +318,7 @@ def train(
                                                                                                   batch,
                                                                                                   pref,
                                                                                                   static_args)
-            for key, value in zip(['lobs_avg', 'lobs_e'],
-                                [jnp.sqrt(loss_obs), jnp.sqrt(loss_obs_raw)]):
-                state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
+            state['lobs_avg'] = state['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
             state['obs_term_avg'] = obs_avg
             state['obs_mean'] = np.mean(obs_batch, axis=0)
             state['logweights'] = logweights
