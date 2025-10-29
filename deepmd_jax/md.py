@@ -1069,7 +1069,7 @@ class TrajDumpSimulation(Simulation):
 
 
 class DPJaxCalculator(Calculator):
-    implemented_properties = ["energy", "forces"]
+    implemented_properties = ["energy", "forces", "stress"]
 
     def __init__(self, 
             model_path,
@@ -1096,48 +1096,14 @@ class DPJaxCalculator(Calculator):
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
 
         self._energy_and_forces_fn = self._get_energy_and_forces_fn()
-        #self._energy_fn = self._get_energy_fn()
-
-    def _get_energy_fn(self, model_and_variables=None):
-        if model_and_variables is None:
-            model_and_variables = (self._model, self._variables)
-        model, variables = model_and_variables
-
-        def energy_fn(coord, nbrs_nm, **kwargs):
-            '''
-                Energy function that can be used in jax_md.simulate routines.
-                You can customize the energy function here, i.e. if you want to add perturbations.
-            '''
-            # if box in kwargs, use it else self._current_box, and convert to (3,3)
-            box = kwargs['box']
-            if box.size == 1:
-                box = box * jnp.eye(3)
-            elif box.shape == (3,):
-                box = jnp.diag(box)
-            # Atoms are reordered and grouped by type in neural network inputs
-            coord = coord[self._type_idx.argsort(kind='stable')]
-            # Ensure coord and box is replicated on all devices
-            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-            coord = jax.lax.with_sharding_constraint(coord, sharding)
-            box = jax.lax.with_sharding_constraint(box, sharding)
-
-            # Energy calculation
-            E = model.apply(variables,
-                            coord,
-                            box,
-                            self._static_args,
-                            nbrs_nm)[0]
-            return E
-
-        return energy_fn
-
+        print("Initializing the DPJaxCalculator")
 
     def _get_energy_and_forces_fn(self, model_and_variables=None):
         if model_and_variables is None:
             model_and_variables = (self._model, self._variables)
         model, variables = model_and_variables
 
-        def energy_fn(coord, nbrs_nm, **kwargs):
+        def energy_fn(coord, nbrs_nm, perturbation=None, **kwargs):
             '''
                 Energy function that can be used in jax_md.simulate routines.
                 You can customize the energy function here, i.e. if you want to add perturbations.
@@ -1150,6 +1116,10 @@ class DPJaxCalculator(Calculator):
                 box = jnp.diag(box)
             # Atoms are reordered and grouped by type in neural network inputs
             coord = coord[self._type_idx.argsort(kind='stable')]
+            # perturbation = 1, required by jax-md stress calculation
+            if perturbation is not None:
+                coord = coord @ perturbation
+                box = box @ perturbation
             # Ensure coord and box is replicated on all devices
             sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
             coord = jax.lax.with_sharding_constraint(coord, sharding)
@@ -1163,11 +1133,40 @@ class DPJaxCalculator(Calculator):
                             nbrs_nm)[0]
             return E
 
+        def stress_fn(coord, nbrs_nm, **kwargs):
+            KE = 0. 
+            # if box in kwargs, use it else self._current_box, and convert to (3,3)
+            box = kwargs['box']
+            if box.size == 1:
+                box = box * jnp.eye(3)
+            elif box.shape == (3,):
+                box = jnp.diag(box)
+            return jax_md.quantity.stress(
+                        energy_fn,
+                        coord,
+                        box,
+                        velocity=None,
+                        nbrs_nm=nbrs_nm,
+                    ) 
+
         def e_and_f(coords, nbrs_nm, **kwargs):
             e, grad = jax.value_and_grad(energy_fn)(coords, nbrs_nm=nbrs_nm, **kwargs)
             return e, -grad
 
-        return jax.jit(e_and_f)
+        def e_and_f_and_s(coords, nbrs_nm, **kwargs):
+            e, grad = jax.value_and_grad(energy_fn)(coords, nbrs_nm=nbrs_nm, **kwargs)
+            stress = stress_fn(coords, nbrs_nm, **kwargs)
+            stress_voigt = jnp.array([
+                stress[0, 0],
+                stress[1, 1],
+                stress[2, 2],
+                stress[1, 2],
+                stress[0, 2],
+                stress[0, 1],
+                ])
+            return e, -grad, stress_voigt
+
+        return jax.jit(e_and_f_and_s)
 
 
     def _get_static_args(self, position, use_neighbor_list=True):
@@ -1219,7 +1218,7 @@ class DPJaxCalculator(Calculator):
             self._construct_nbr_and_nbr_fn(coords)
         # Perhaps here we can update the neighbor list if there is already one
 
-        self.results["energy"], self.results["forces"] = self._energy_and_forces_fn(
+        self.results["energy"], self.results["forces"], self.results["stress"] = self._energy_and_forces_fn(
                 coords,
                 box=box,
                 nbrs_nm=self._typed_nbrs.nbrs_nm if self.use_neighbor_list else None,
