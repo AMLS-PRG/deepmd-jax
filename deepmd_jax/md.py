@@ -1108,7 +1108,7 @@ class DPJaxCalculator(Calculator):
                 Energy function that can be used in jax_md.simulate routines.
                 You can customize the energy function here, i.e. if you want to add perturbations.
             '''
-            # if box in kwargs, use it else self._current_box, and convert to (3,3)
+            # if box in kwargs convert to (3,3)
             box = kwargs['box']
             if box.size == 1:
                 box = box * jnp.eye(3)
@@ -1134,8 +1134,7 @@ class DPJaxCalculator(Calculator):
             return E
 
         def stress_fn(coord, nbrs_nm, **kwargs):
-            KE = 0. 
-            # if box in kwargs, use it else self._current_box, and convert to (3,3)
+            # if box in kwargs and convert to (3,3)
             box = kwargs['box']
             if box.size == 1:
                 box = box * jnp.eye(3)
@@ -1160,11 +1159,12 @@ class DPJaxCalculator(Calculator):
                 stress[0, 0],
                 stress[1, 1],
                 stress[2, 2],
-                stress[1, 2],
-                stress[0, 2],
-                stress[0, 1],
+                0.0, # stress[1, 2],
+                0.0, # stress[0, 2],
+                0.0, # stress[0, 1],
                 ])
-            return e, -grad, stress_voigt
+            # Note the minus sign in the stress below, to match ASE's convention
+            return e, -grad, -stress_voigt
 
         return jax.jit(e_and_f_and_s)
 
@@ -1206,10 +1206,13 @@ class DPJaxCalculator(Calculator):
         coords = jnp.array(pos) * jnp.ones(1) # Ensure default precision
 
         cell = np.asarray(self.atoms.get_cell())  # (3,3)
-        if np.allclose(cell, np.diag(np.diag(cell))):  # orthorhombic check
-            box = jnp.array(np.diag(cell), dtype=jnp.float32)  # (3,)
+        if self.use_neighbor_list:
+            if np.allclose(cell, np.diag(np.diag(cell))):  # orthorhombic check
+                box = jnp.array(np.diag(cell), dtype=jnp.float32)  # (3,)
+            else:
+                raise NotImplementedError("Non-orthorhombic cells not supported with neighbor lists")
         else:
-            raise NotImplementedError("Non-orthorhombic cells not supported in this neighbor list")
+            box = jnp.array(cell)
         self._current_box = box
 
         self._static_args = self._get_static_args(coords,use_neighbor_list=self.use_neighbor_list)
