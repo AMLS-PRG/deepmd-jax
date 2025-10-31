@@ -1077,10 +1077,12 @@ class DPJaxCalculator(Calculator):
             use_neighbor_list=True,
             neighbor_skin: float = None,
             neighbor_buffer_ratio: float = 1.2,
+            dtype=jnp.float32,
             **kwargs):
 
         self.atoms = None
         self.use_cache = False
+        self._dtype = dtype
 
         self._model, self._variables = load_model(model_path)
 
@@ -1120,10 +1122,14 @@ class DPJaxCalculator(Calculator):
             if perturbation is not None:
                 coord = coord @ perturbation
                 box = box @ perturbation
+                #coord = perturbation @ coord.T
+                #coord = coord.T
+                #box = perturbation @ box
             # Ensure coord and box is replicated on all devices
-            sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
-            coord = jax.lax.with_sharding_constraint(coord, sharding)
-            box = jax.lax.with_sharding_constraint(box, sharding)
+            if len(jax.devices()) > 1:
+                sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
+                coord = jax.lax.with_sharding_constraint(coord, sharding)
+                box = jax.lax.with_sharding_constraint(box, sharding)
 
             # Energy calculation
             E = model.apply(variables,
@@ -1159,14 +1165,15 @@ class DPJaxCalculator(Calculator):
                 stress[0, 0],
                 stress[1, 1],
                 stress[2, 2],
-                0.0, # stress[1, 2],
-                0.0, # stress[0, 2],
-                0.0, # stress[0, 1],
-                ])
+                stress[1, 2],  
+                stress[0, 2], 
+                stress[0, 1], 
+                ], dtype=self._dtype)
             # Note the minus sign in the stress below, to match ASE's convention
+            # Also, the off-diagonal components have not been tested
             return e, -grad, -stress_voigt
 
-        return jax.jit(e_and_f_and_s)
+        return jax.jit(e_and_f_and_s, static_argnames=())
 
 
     def _get_static_args(self, position, use_neighbor_list=True):
@@ -1203,19 +1210,19 @@ class DPJaxCalculator(Calculator):
         # Get positions and cell from ASE
         pos = self.atoms.get_positions()  # (N,3), in Å
         self._natoms = pos.shape[0]
-        coords = jnp.array(pos) * jnp.ones(1) # Ensure default precision
+        coords = jnp.array(pos, dtype=self._dtype)
 
         cell = np.asarray(self.atoms.get_cell())  # (3,3)
         if self.use_neighbor_list:
             if np.allclose(cell, np.diag(np.diag(cell))):  # orthorhombic check
-                box = jnp.array(np.diag(cell), dtype=jnp.float32)  # (3,)
+                box = jnp.array(np.diag(cell), dtype=self._dtype)  # (3,)
             else:
                 raise NotImplementedError("Non-orthorhombic cells not supported with neighbor lists")
         else:
-            box = jnp.array(cell)
+            box = jnp.array(cell, dtype=self._dtype)
+       
         self._current_box = box
-
-        self._static_args = self._get_static_args(coords,use_neighbor_list=self.use_neighbor_list)
+        self._static_args = self._get_static_args(coords, use_neighbor_list=self.use_neighbor_list)
 
         if self.use_neighbor_list:
             self._construct_nbr_and_nbr_fn(coords)
