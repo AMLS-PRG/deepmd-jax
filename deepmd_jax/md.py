@@ -1074,9 +1074,6 @@ class DPJaxCalculator(Calculator):
     def __init__(self, 
             model_path,
             type_idx = None, 
-            use_neighbor_list=True,
-            neighbor_skin: float = None,
-            neighbor_buffer_ratio: float = 1.2,
             dtype=jnp.float32,
             **kwargs):
 
@@ -1085,13 +1082,6 @@ class DPJaxCalculator(Calculator):
         self._dtype = dtype
 
         self._model, self._variables = load_model(model_path)
-
-        self.use_neighbor_list = use_neighbor_list
-        if neighbor_skin is None:
-            self._neighbor_skin = 0.3
-        else:
-            self._neighbor_skin = neighbor_skin
-        self._neighbor_buffer_ratio = neighbor_buffer_ratio
 
         self._type_idx = type_idx.astype(int)
         type_count = np.bincount(self._type_idx)
@@ -1105,26 +1095,17 @@ class DPJaxCalculator(Calculator):
             model_and_variables = (self._model, self._variables)
         model, variables = model_and_variables
 
-        def energy_fn(coord, nbrs_nm, perturbation=None, **kwargs):
+        def energy_fn(coord, box, nbrs_nm=None, perturbation=None, **kwargs):
             '''
                 Energy function that can be used in jax_md.simulate routines.
                 You can customize the energy function here, i.e. if you want to add perturbations.
             '''
-            # if box in kwargs convert to (3,3)
-            box = kwargs['box']
-            if box.size == 1:
-                box = box * jnp.eye(3)
-            elif box.shape == (3,):
-                box = jnp.diag(box)
             # Atoms are reordered and grouped by type in neural network inputs
             coord = coord[self._type_idx.argsort(kind='stable')]
             # perturbation = 1, required by jax-md stress calculation
             if perturbation is not None:
                 coord = coord @ perturbation
                 box = box @ perturbation
-                #coord = perturbation @ coord.T
-                #coord = coord.T
-                #box = perturbation @ box
             # Ensure coord and box is replicated on all devices
             if len(jax.devices()) > 1:
                 sharding = jax.sharding.PositionalSharding(jax.devices()).replicate()
@@ -1139,28 +1120,18 @@ class DPJaxCalculator(Calculator):
                             nbrs_nm)[0]
             return E
 
-        def stress_fn(coord, nbrs_nm, **kwargs):
-            # if box in kwargs and convert to (3,3)
-            box = kwargs['box']
-            if box.size == 1:
-                box = box * jnp.eye(3)
-            elif box.shape == (3,):
-                box = jnp.diag(box)
+        def stress_fn(coord, box, **kwargs):
             return jax_md.quantity.stress(
                         energy_fn,
                         coord,
                         box,
                         velocity=None,
-                        nbrs_nm=nbrs_nm,
+                        nbrs_nm=None,
                     ) 
 
-        def e_and_f(coords, nbrs_nm, **kwargs):
-            e, grad = jax.value_and_grad(energy_fn)(coords, nbrs_nm=nbrs_nm, **kwargs)
-            return e, -grad
-
-        def e_and_f_and_s(coords, nbrs_nm, **kwargs):
-            e, grad = jax.value_and_grad(energy_fn)(coords, nbrs_nm=nbrs_nm, **kwargs)
-            stress = stress_fn(coords, nbrs_nm, **kwargs)
+        def e_and_f_and_s(coords, box, **kwargs):
+            e, grad = jax.value_and_grad(energy_fn)(coords, box, **kwargs)
+            stress = stress_fn(coords, box, **kwargs)
             stress_voigt = jnp.array([
                 stress[0, 0],
                 stress[1, 1],
@@ -1176,60 +1147,43 @@ class DPJaxCalculator(Calculator):
         return jax.jit(e_and_f_and_s, static_argnames=())
 
 
-    def _get_static_args(self, position, use_neighbor_list=True):
+    def _get_static_args(self, position):
         '''
             Returns a FrozenDict of the complete set of static arguments for jit compilation.
         '''
-        if use_neighbor_list:
-            static_args = nn.FrozenDict({'type_count':self._type_count, 'use_neighbor_list':True})
-            return static_args
-        else:
-            box = jnp.diag(self._current_box) if self._current_box.shape == (3,) else self._current_box
-            lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'])
-            static_args = nn.FrozenDict({'type_count':self._type_count, 'lattice':lattice_args, 'use_neighbor_list':False})
-            return static_args
+        box = self._current_box
+        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'])
+        static_args = nn.FrozenDict({'type_count':self._type_count, 'lattice':lattice_args, 'use_neighbor_list':False})
+        return static_args
 
-    def _construct_nbr_and_nbr_fn(self, position=None):
-        '''
-            Initial construction, or reconstruction when dr_buffer_neighbor or neighbor_buffer_ratio changes.
-        '''
-        self._typed_nbr_fn = typed_neighbor_list(self._current_box,
-                                                 self._type_idx,
-                                                 self._type_count,
-                                                 self._model.params['rcut'] + self._neighbor_skin,
-                                                 self._neighbor_buffer_ratio)
-        self._typed_nbrs = self._typed_nbr_fn.allocate(position,
-                                                       box=self._current_box)
-
-
-    def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
 
         if atoms is not None:
             self.atoms = atoms.copy()
+
+        cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
+        ## Check if cell is upper triangular and write an warning message, if it is not
+        is_upper = np.allclose(cell[np.tril_indices(3, k=-1)], 0, atol=1e-8)
+        if not is_upper:
+            self.atoms.set_cell(self.atoms.cell.standard_form(form="upper")[0], scale_atoms=True)
+            cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
+            print("# Warning: Box is not upper triangular - code behavior needs further testing")
+        box = jnp.array(cell, dtype=self._dtype)
+        self._current_box = box
 
         # Get positions and cell from ASE
         pos = self.atoms.get_positions()  # (N,3), in Å
         self._natoms = pos.shape[0]
         coords = jnp.array(pos, dtype=self._dtype)
 
-        cell = np.asarray(self.atoms.get_cell())  # (3,3)
-        if self.use_neighbor_list:
-            if np.allclose(cell, np.diag(np.diag(cell))):  # orthorhombic check
-                box = jnp.array(np.diag(cell), dtype=self._dtype)  # (3,)
-            else:
-                raise NotImplementedError("Non-orthorhombic cells not supported with neighbor lists")
-        else:
-            box = jnp.array(cell, dtype=self._dtype)
-       
-        self._current_box = box
-        self._static_args = self._get_static_args(coords, use_neighbor_list=self.use_neighbor_list)
+        self._static_args = self._get_static_args(coords)
 
-        if self.use_neighbor_list:
-            self._construct_nbr_and_nbr_fn(coords)
-        # Perhaps here we can update the neighbor list if there is already one
+        E, F, S = self._energy_and_forces_fn(
+            coords,
+            box,
+            )
 
-        self.results["energy"], self.results["forces"], self.results["stress"] = self._energy_and_forces_fn(
-                coords,
-                box=box,
-                nbrs_nm=self._typed_nbrs.nbrs_nm if self.use_neighbor_list else None,
-                )
+        # Convert JAX arrays to numpy
+        self.results["energy"] = float(E)
+        self.results["forces"] = np.asarray(F)
+        self.results["stress"] = np.asarray(S)
