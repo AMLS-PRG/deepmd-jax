@@ -118,9 +118,9 @@ class DPModel(nn.Module):
             loss_and_grad = value_and_grad(loss_atomic)
             return loss_atomic, loss_and_grad
 
-    def get_observable_loss_fn(self, target_observable, temperature):
+    def get_observable_loss_fn(self):
         vmap_energy = vmap(self.energy, (None, 0, 0, None))
-        def loss_obs(variables, batch_data, pref, static_args):
+        def loss_obs(variables, batch_data, pref, static_args, temperature, target_observable):
             e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
             kb = 8.617333262e-5
             beta = 1 / (kb * temperature)
@@ -136,9 +136,9 @@ class DPModel(nn.Module):
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
     
-    def get_weights(self, temperature):
+    def get_weights(self):
         vmap_energy = vmap(self.energy, (None, 0, 0, None))
-        def weights(variables, batch_data, static_args):
+        def weights(variables, batch_data, static_args, temperature):
             e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
             kb = 8.617333262e-5
             beta = 1 / (kb * temperature)
