@@ -18,8 +18,7 @@ def train(
     model_type: str,
     rcut: float,
     train_data_path: Union[str, List[str]],
-    train_data_path_obs: Union[str, List[str]] = None,
-    ess_data_path: Union[str, List[str]] = None,
+    train_data_path_obs: Union[str, List[str], List[List[str]]] = None,
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
     progress_path: str = 'progress.out',
@@ -28,6 +27,7 @@ def train(
     print_distribution: bool = False,
     plot_distribution: bool = False,
     step: int = 1000000,
+    obs_step_every: int = 1,
     mp: bool = False,
     atomic_sel: List[int] = None,
     embed_widths: List[int] = [32,32,64],
@@ -64,8 +64,8 @@ def train(
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
     seed: int = None,
-    temperature: float = 300,
-    target_observable: Union[float, str, None] = None,
+    temperature: Union[float, list] = None,
+    target_observable: Union[float, str, list, None] = None,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -88,7 +88,6 @@ def train(
             lr: learning rate at start. If None, default values (0.002 for 'energy' and 0.01 for 'atomic') is used.
             batch_size: training batch size in number of frames. If None, will be automatically determined by label_bs.
             val_batch_size_ratio: validation batch size / batch_size. Increase for stabler validation loss.
-            batch_size_ess: batch size for computing effective sample size. Only used when ess_data_path is provided.
             compress: whether to compress the model after training for faster inference.
             print_every: interval for printing loss and validation.
             atomic_data_prefix: prefix for .npy label files when model_type == 'atomic'.
@@ -172,17 +171,29 @@ def train(
                            {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
     if model_type == 'observables':
-        if train_data_path_obs is None: train_data_path_obs = train_data_path
-        elif type(train_data_path_obs) == str:
-            train_data_path_obs = [train_data_path_obs]
-        else:
-            train_data_path_obs = [[path] for path in train_data_path_obs]
+        # Multiple temperatures (quick and dirty implementation)
         labels_obs = labels + ['observable']
         labels_obs = [item for item in labels_obs if item != 'force']
-        train_data_obs = DPDataset(train_data_path_obs,
-                                   labels_obs,
-                                   {'atomic_sel':atomic_sel})
-        train_data_obs.compute_lattice_candidate(rcut)
+        if type(temperature) == list:
+            train_data_obs = []
+            for i in range(len(temperature)):
+                _train_data_path_obs = [[path] for path in train_data_path_obs[i]]
+                single_data_obs = DPDataset(_train_data_path_obs,
+                                            labels_obs,
+                                            {'atomic_sel':atomic_sel})
+                single_data_obs.compute_lattice_candidate(rcut)
+                train_data_obs.append(single_data_obs)
+        else:
+            if train_data_path_obs is None: print('# Error: Must provide train_data_path_obs for model_type "observables".')
+            elif type(train_data_path_obs) == str:
+                train_data_path_obs = [train_data_path_obs]
+            else:
+                train_data_path_obs = [[path] for path in train_data_path_obs]
+            train_data_obs = DPDataset(train_data_path_obs,
+                                       labels_obs,
+                                       {'atomic_sel':atomic_sel})
+            train_data_obs.compute_lattice_candidate(rcut)
+            train_data_obs = [train_data_obs]
     use_val_data = val_data_path is not None
     if use_val_data:
         if type(val_data_path) == str:
@@ -195,13 +206,6 @@ def train(
         val_data.compute_lattice_candidate(rcut)
     else:
         val_data = None
-    if ess_data_path is not None:
-        ess_data_path = [ess_data_path]
-        labels_ess = [item for item in labels if item != 'force']
-        ess_data = DPDataset(ess_data_path,
-                             labels_ess,
-                             {'atomic_sel':atomic_sel})
-        ess_data.compute_lattice_candidate(rcut)
 
     # for dplr, convert dataset to short-range
     if model_type == 'dplr':
@@ -296,34 +300,41 @@ def train(
     if target_observable is None and model_type == 'observables':
         raise ValueError('Must provide target_observable for model_type "observables".')
     if isinstance(target_observable, str):
-        target_observable = np.load(target_observable)
+        target_observable = [np.load(target_observable)]
+    elif isinstance(target_observable, list) and isinstance(target_observable[0], str):
+        target_observable = [np.load(path) for path in target_observable]
 
-    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn(target_observable, temperature)
-    weights = model.get_weights(temperature)
+    if isinstance(temperature, (int, float)):
+        temperature = [temperature]
+
+    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
+    weights = model.get_weights()
     if model_type == 'observables':
-        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'lobs_avg': 0., 
-                 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 
-                 'ESS': 1. , 'iteration': 0}    
+        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
+        _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
+        state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
     elif model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     
-    @partial(jax.jit, static_argnames=('static_args', 'observable_step'))
-    def train_step(batch, variables, opt_state, state, static_args, observable_step=False):
+    @partial(jax.jit, static_argnames=('static_args', 'observable_step', 'possition'))
+    def train_step(batch, variables, opt_state, state, state_obs, static_args, observable_step=False, possition=0):
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
             pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
             (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
-                                                                                                  batch,
-                                                                                                  pref,
-                                                                                                  static_args)
-            state['lobs_avg'] = state['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
-            state['obs_term_avg'] = obs_avg
-            state['obs_mean'] = np.mean(obs_batch, axis=0)
-            state['logweights'] = logweights
+                                                                                                batch,
+                                                                                                pref,
+                                                                                                static_args,
+                                                                                                temperature[possition],
+                                                                                                target_observable[possition])
+            state_obs[possition]['lobs_avg'] = state_obs[possition]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
+            state_obs[possition]['obs_term_avg'] = obs_avg
+            state_obs[possition]['obs_mean'] = np.mean(obs_batch, axis=0)
+            state_obs[possition]['logweights'] = logweights
             weights = jnp.exp(logweights)
-            state['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+            state_obs[possition]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
         elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
@@ -342,7 +353,7 @@ def train(
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
         if not observable_step: state['iteration'] += 1
-        return variables, opt_state, state
+        return variables, opt_state, state, state_obs
     
     # define validation step
     @partial(jax.jit, static_argnames=('static_args',))
@@ -367,14 +378,14 @@ def train(
         print(f'# Batch size = {batch_size}')
     if model_type == 'observables':
         print(f'# Observable loss batch size = {batch_size_observable}')
-    def get_batch_train(observable_step=False):
+    def get_batch_train(observable_step=False, possition=0):
         if not observable_step:
             if batch_size is None:
                 return train_data.get_batch(label_bs, 'label')
             else:
                 return train_data.get_batch(batch_size)
         else:
-            return train_data_obs.get_batch(batch_size_observable)
+            return train_data_obs[possition].get_batch(batch_size_observable)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -383,35 +394,34 @@ def train(
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
-    def get_batch_ess():
-        return ess_data.get_batch(batch_size_ess)
 
     # define print step in progress file
-    def print_progress(state_keys: List, validation=None, **kwargs):
+    def print_progress(state_keys: List, state_obs_keys: List, validation=None):
         state_values = [state[key] for key in state_keys]
-        for count in range(len(state_values)):
-            state_values[count] = np.max(state_values[count])
-        kwarg_values = [kwargs[key] for key in kwargs.keys()]
+        state_obs_values = []
+        for i in range(len(train_data_path_obs)):
+            _state_values = [state_obs[i][key] for key in state_obs_keys]
+            state_obs_values.append(_state_values)
+        for i in range(len(state_values)):
+            state_values[i] = np.max(state_values[i])
+        for i in range(len(train_data_path_obs)):
+            for j in range(len(state_obs_keys)):
+                state_obs_values[i][j] = np.max(state_obs_values[i][j])
         mode = 'w' if iteration == 0 else 'a'
         if validation is not None:
             state_keys += ['le_val', 'lf_val']
             state_values += validation
         with open(progress_path, mode) as file:
             if iteration == 0:
-                keys = state_keys + list(kwargs.keys())
-                file.write('  '.join(f'{key:>12}' for key in keys) + '\n')
+                file.write('  '.join(f'{key:>12}' for key in state_keys))
+                if len(train_data_path_obs) > 1:
+                    file.write('   ' + '  '.join(f'{key}_{temperature[poss]}K' for poss in range(len(train_data_path_obs)) for key in state_obs_keys) + '\n')
+                else:
+                    file.write('   ' + '  '.join(f'{key:>12}' for key in state_obs_keys) + '\n')
             iter_str = f'{int(state_values[0]):>12}  '
             loss_str = '  '.join(f'{value:>12.4e}' for value in state_values[1:])
-            kwarg_str = '  ' + '  '.join(f'{value:>12.4e}' for value in kwarg_values)
-            file.write(iter_str + loss_str + kwarg_str + '\n')
-
-    def ESS(variables, batch, static_args):
-        weights = model.get_weights(temperature)
-        logweights = weights(variables, batch, static_args)
-        logweights -= jnp.amax(logweights)
-        weights = jnp.exp(logweights)
-        ESS = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
-        return ESS
+            obs_str = '  '.join(f'{value:>12.4e}' for i in range(len(train_data_path_obs)) for value in state_obs_values[i])
+            file.write(iter_str + loss_str + obs_str + '\n')
     
     def print_distr():
         obs_total = []
@@ -446,73 +456,72 @@ def train(
         if iteration % print_every == 0:
             if model_type == 'observables':
                 if use_val_data:
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'], validation)
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ['lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'], validation)
                 else:
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg', 'lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'])
+                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ['lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'])
             else:
-                if ess_data_path is not None:
-                    batch_ess, _, _ = get_batch_ess()
-                    ess = ESS(variables, batch_ess, static_args)
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ESS=ess)
-                else:
                     print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'])
 
         # training step part 1: energy and force
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                      'lattice': lattice_args})
-        variables, opt_state, state = train_step(batch,
+        variables, opt_state, state, _ = train_step(batch,
                                                  variables,
                                                  opt_state,
                                                  state,
+                                                 state_obs,
                                                  static_args)
         # training step part 2: observables
-        if model_type == 'observables':
+        if model_type == 'observables' and iteration % obs_step_every == 0:
             # observable train step
-            batch, type_count, lattice_args = get_batch_train(observable_step=True)
-            static_args = nn.FrozenDict({'type_count': tuple(type_count),
-                                        'lattice': lattice_args})
-            variables, opt_state, state = train_step(batch,
-                                                    variables,
-                                                    opt_state,
-                                                    state,
-                                                    static_args,
-                                                    observable_step=True) 
+            for i in range(len(train_data_path_obs)):
+                batch, type_count, lattice_args = get_batch_train(observable_step=True, possition=i)
+                static_args = nn.FrozenDict({'type_count': tuple(type_count),
+                                            'lattice': lattice_args})
+                variables, opt_state, state, state_obs = train_step(batch,
+                                                        variables,
+                                                        opt_state,
+                                                        state,
+                                                        state_obs,
+                                                        static_args,
+                                                        observable_step=True,
+                                                        possition=i) 
 
             # plot observable distribution
-            if plot_distribution and iteration % plot_every == 0:
-                if iteration == 0:
-                    fig = distribution_plot()
-                    fig.reference(train_data_obs.subsets[0].data['observable'], label='Reference')
-                    colors = ["yellow", "orange", "red"]
-                    cmap = LinearSegmentedColormap.from_list("my_colormap", colors)
-                    #cmap = get_cmap('Greens')
-                    color_grad = iter([cmap(i) for i in np.linspace(0., 1., int(step/plot_every))])
-                else:
-                    obs_fullset = []
-                    logweights_fullset = []
-                    for i in range(int(train_data_obs.nframes/batch_size_observable)):
-                        _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
-                        obs_fullset = np.append(obs_fullset, _batch['observable'])
-                        pred_logweights = weights(variables, _batch, static_args)
-                        logweights_fullset = np.append(logweights_fullset, pred_logweights)
-                    logweights_fullset -= logweights_fullset.max()
-                    weights_fullset = np.exp(logweights_fullset)
-                    fig.add_histogram(obs_fullset, weights_fullset, label=f'Iteration {iteration:,}', color=next(color_grad))
+            #if plot_distribution and iteration % plot_every == 0:
+            #    if iteration == 0:
+            #        fig = distribution_plot()
+            #        fig.reference(train_data_obs.subsets[0].data['observable'], label='Reference')
+            #        colors = ["yellow", "orange", "red"]
+            #        cmap = LinearSegmentedColormap.from_list("my_colormap", colors)
+            #        #cmap = get_cmap('Greens')
+            #        color_grad = iter([cmap(i) for i in np.linspace(0., 1., int(step/plot_every))])
+            #    else:
+            #        obs_fullset = []
+            #        logweights_fullset = []
+            #        for i in range(int(train_data_obs.nframes/batch_size_observable)):
+            #            _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
+            #            obs_fullset = np.append(obs_fullset, _batch['observable'])
+            #            pred_logweights = weights(variables, _batch, static_args)
+            #            logweights_fullset = np.append(logweights_fullset, pred_logweights)
+           #         logweights_fullset -= logweights_fullset.max()
+           #         weights_fullset = np.exp(logweights_fullset)
+           #         fig.add_histogram(obs_fullset, weights_fullset, label=f'Iteration {iteration:,}', color=next(color_grad))
 
-    if plot_distribution: fig.savefig(plot_path)
+    #if plot_distribution: fig.savefig(plot_path)
 
     # print observable distribution
-    if model_type == 'observables' and print_distribution:
-        print('# Printing observable distribution to', distribution_path)
-        print_distr()
+    #if model_type == 'observables' and print_distribution:
+    #    print('# Printing observable distribution to', distribution_path)
+    #    print_distr()
 
     # compress, save, and finish
     if compress:
-        model, variables = compress_model(model,
-                                                variables,
-                                                compress_Ngrids,
-                                                compress_r_min)
+        model, variables = compress_model(model, 
+                                          variables, 
+                                          compress_Ngrids, 
+                                          compress_r_min)
     save_model(save_path, model, variables)
     print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
 
