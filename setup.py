@@ -19,9 +19,7 @@ setup(
         'seaborn',
         'pandas',
     ],
-    author='Ruiqi Gao',
-    author_email='ruiqigao@princeton.edu',
     description='DP-JAX',
-    url='https://github.com/SparkyTruck/deepmd-jax',
+    url='https://github.com/AMLS-PRG/deepmd-jax',
     python_requires='>=3.10',
 )
