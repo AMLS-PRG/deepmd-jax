@@ -17,6 +17,7 @@ setup(
         'gpustat',
         'ipykernel',
         'seaborn',
+        'pandas',
     ],
     author='Ruiqi Gao',
     author_email='ruiqigao@princeton.edu',
