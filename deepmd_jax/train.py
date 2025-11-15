@@ -313,7 +313,9 @@ def train(
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
     if target_observable is None and model_type == 'observables':
         raise ValueError('Must provide target_observable for model_type "observables".')
-    if isinstance(target_observable, str):
+    if isinstance(target_observable, (int, float)):
+        target_observable = [target_observable]
+    elif isinstance(target_observable, str):
         target_observable = [np.load(target_observable)]
     elif isinstance(target_observable, list) and isinstance(target_observable[0], str):
         target_observable = [np.load(path) for path in target_observable]
@@ -323,6 +325,7 @@ def train(
 
     loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
     weights = model.get_weights()
+    state_obs = {}
     if model_type == 'observables':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
@@ -410,17 +413,18 @@ def train(
         return ret
 
     # define print step in progress file
-    def print_progress(state_keys: List, state_obs_keys: List, validation=None):
+    def print_progress(state_keys: List, state_obs_keys: List = None, validation=None):
         state_values = [state[key] for key in state_keys]
         state_obs_values = []
-        for i in range(len(train_data_path_obs)):
-            _state_values = [state_obs[i][key] for key in state_obs_keys]
-            state_obs_values.append(_state_values)
         for i in range(len(state_values)):
             state_values[i] = np.max(state_values[i])
-        for i in range(len(train_data_path_obs)):
-            for j in range(len(state_obs_keys)):
-                state_obs_values[i][j] = np.max(state_obs_values[i][j])
+        if state_obs_keys is not None:
+            for i in range(len(train_data_path_obs)):
+                _state_values = [state_obs[i][key] for key in state_obs_keys]
+                state_obs_values.append(_state_values)
+            for i in range(len(train_data_path_obs)):
+                for j in range(len(state_obs_keys)):
+                    state_obs_values[i][j] = np.max(state_obs_values[i][j])
         mode = 'w' if iteration == 0 else 'a'
         if validation is not None:
             state_keys += ['le_val', 'lf_val']
@@ -428,13 +432,17 @@ def train(
         with open(progress_path, mode) as file:
             if iteration == 0:
                 file.write('  '.join(f'{key:>12}' for key in state_keys))
-                if len(train_data_path_obs) > 1:
-                    file.write('   ' + '  '.join(f'{key}_{temperature[poss]}K' for poss in range(len(train_data_path_obs)) for key in state_obs_keys) + '\n')
-                else:
-                    file.write('   ' + '  '.join(f'{key:>12}' for key in state_obs_keys) + '\n')
+                if state_obs_keys is not None:
+                    if len(train_data_path_obs) > 1:
+                        file.write('   ' + '  '.join(f'{key}_{temperature[poss]}K' for poss in range(len(train_data_path_obs)) for key in state_obs_keys) + '\n')
+                    else:
+                        file.write('   ' + '  '.join(f'{key:>12}' for key in state_obs_keys) + '\n')
             iter_str = f'{int(state_values[0]):>12}  '
             loss_str = '  '.join(f'{value:>12.4e}' for value in state_values[1:])
-            obs_str = '  '.join(f'{value:>12.4e}' for i in range(len(train_data_path_obs)) for value in state_obs_values[i])
+            if state_obs_keys is not None:
+                obs_str = '  '.join(f'{value:>12.4e}' for i in range(len(train_data_path_obs)) for value in state_obs_values[i])
+            else:
+                obs_str = ''
             file.write(iter_str + loss_str + obs_str + '\n')
     
     def print_distr():
