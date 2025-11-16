@@ -5,12 +5,11 @@ from setuptools.command.install import install
 
 setup(
     name='deepmd_jax',
-    version='0.2',
     packages=find_packages(),
     install_requires=[
-        'jax[cuda12]',
-        'flax',
-        'optax',
+        'jax[cuda12]==0.6.2',
+        'flax==0.10.6',
+        'optax==0.2.5',
         'jax-md @ git+https://github.com/google/jax-md.git',
         'ase',
         'matplotlib',
