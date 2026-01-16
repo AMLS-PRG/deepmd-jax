@@ -1148,7 +1148,7 @@ class DPJaxCalculator(Calculator):
         self._model, self._variables = load_model(model_path)
         self._static_args = None
 
-        self._type_idx = type_idx.astype(int)
+        self._type_idx = np.array(type_idx).astype(int)
         type_count = np.bincount(self._type_idx)
         self._type_count = np.pad(type_count, (0, self._model.params['ntypes'] - len(type_count)))
 
@@ -1218,7 +1218,8 @@ class DPJaxCalculator(Calculator):
             Returns a FrozenDict of the complete set of static arguments for jit compilation.
         '''
         box = self._current_box
-        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False)
+        # it is important to disable_ortho to compute the stress tensor correctly, even for orthogonal boxes
+        lattice_args = compute_lattice_candidate(box[None], self._model.params['rcut'], print_info=False, disable_ortho=True)
         static_args = nn.FrozenDict({'type_count':tuple(self._type_count), 'lattice':lattice_args, 'use_neighbor_list':False})
         return static_args
 

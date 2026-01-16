@@ -132,7 +132,7 @@ class DPDataset():
         else:
             return sum([subset.get_flattened_data() for subset in self.subsets], [])
 
-def compute_lattice_candidate(boxes, rcut, print_info=True): # boxes (nframes,3,3)
+def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False): # boxes (nframes,3,3)
     N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.
     ortho = not vmap(lambda box: box - jnp.diag(jnp.diag(box)))(boxes).any()
     recp_norm = jnp.linalg.norm((jnp.linalg.inv(boxes)), axis=-1)    # (nframes,3)
@@ -144,4 +144,6 @@ def compute_lattice_candidate(boxes, rcut, print_info=True): # boxes (nframes,3,
     lattice_max = is_neighbor.sum(1).max().item()
     if print_info:
         print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (lattice_max, len(lattice_cand)))
-    return {'lattice_cand': tuple(map(tuple, lattice_cand)), 'lattice_max': lattice_max, 'ortho': ortho}
+    return {'lattice_cand': tuple(map(tuple, lattice_cand)),
+            'lattice_max': lattice_max,
+            'ortho': ortho if not disable_ortho else False}
