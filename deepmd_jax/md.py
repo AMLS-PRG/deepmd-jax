@@ -1229,12 +1229,6 @@ class DPJaxCalculator(Calculator):
             self.atoms = atoms.copy()
 
         cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
-        ## Check if cell is upper triangular and write an warning message, if it is not
-        is_upper = np.allclose(cell[np.tril_indices(3, k=-1)], 0, atol=1e-8)
-        if not is_upper:
-            self.atoms.set_cell(self.atoms.cell.standard_form(form="upper")[0], scale_atoms=True)
-            cell = np.asarray(self.atoms.get_cell(complete=True))  # Use complete=True for (3,3)
-            print("# Warning: Box is not upper triangular - code behavior needs further testing")
         box = jnp.array(cell, dtype=self._dtype)
         self._current_box = box
 
