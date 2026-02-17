@@ -10,7 +10,7 @@ setup(
         'jax[cuda12]==0.6.2',
         'flax==0.10.6',
         'optax==0.2.5',
-        'jax-md @ git+https://github.com/google/jax-md.git',
+        'jax-md==0.2.27',
         'ase',
         'matplotlib',
         'gpustat',
