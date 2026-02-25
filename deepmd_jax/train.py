@@ -310,8 +310,8 @@ def train(
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     
-    @partial(jax.jit, static_argnames=('static_args', 'observable_step', 'possition'))
-    def train_step(batch, variables, opt_state, state, state_obs, static_args, observable_step=False, possition=0):
+    @partial(jax.jit, static_argnames=('static_args', 'observable_step', 'obs_position'))
+    def train_step(batch, variables, opt_state, state, state_obs, static_args, observable_step=False, obs_position=0):
         r = lr_scheduler(state['iteration']) / lr
         if observable_step:
             pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
@@ -319,14 +319,14 @@ def train(
                                                                                                 batch,
                                                                                                 pref,
                                                                                                 static_args,
-                                                                                                temperature[possition],
-                                                                                                target_observable[possition])
-            state_obs[possition]['lobs_avg'] = state_obs[possition]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
-            state_obs[possition]['obs_term_avg'] = obs_avg
-            state_obs[possition]['obs_mean'] = np.mean(obs_batch, axis=0)
-            state_obs[possition]['logweights'] = logweights
+                                                                                                temperature[obs_position],
+                                                                                                target_observable[obs_position])
+            state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
+            state_obs[obs_position]['obs_term_avg'] = obs_avg
+            state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
+            state_obs[obs_position]['logweights'] = logweights
             weights = jnp.exp(logweights)
-            state_obs[possition]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+            state_obs[obs_position]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
         elif model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
@@ -335,13 +335,13 @@ def train(
                                                                     pref,
                                                                     static_args)
             for key, value in zip(['loss_avg', 'le_avg', 'lf_avg'],
-                                [jnp.sqrt(loss_total), jnp.sqrt(loss_e), jnp.sqrt(loss_f)]):
-                state[key] = state[key] * (1-1/print_loss_smoothing) + value * 1/print_loss_smoothing
+                                  [loss_total, loss_e, loss_f]):
+                state[key] = state[key] * (1-1/print_loss_smoothing) + value
         else:
             loss_total, grads = loss_and_grad_fn(variables,
                                                  batch,
                                                  static_args)
-            state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total * 1/print_loss_smoothing
+            state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
         if not observable_step: state['iteration'] += 1
@@ -370,14 +370,14 @@ def train(
         print(f'# Batch size = {batch_size}')
     if model_type == 'observables':
         print(f'# Observable loss batch size = {batch_size_observable}')
-    def get_batch_train(observable_step=False, possition=0):
+    def get_batch_train(observable_step=False, obs_position=0):
         if not observable_step:
             if batch_size is None:
                 return train_data.get_batch(label_bs, 'label')
             else:
                 return train_data.get_batch(batch_size)
         else:
-            return train_data_obs[possition].get_batch(batch_size_observable)
+            return train_data_obs[obs_position].get_batch(batch_size_observable)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -386,44 +386,32 @@ def train(
             else:
                 ret.append(val_data.get_batch(batch_size))
         return ret
-
-    # define print step in progress file
-    def print_progress(state_keys: List, state_obs_keys: List = None, validation=None):
-        state_values = [state[key] for key in state_keys]
-        state_obs_values = []
-        for i in range(len(state_values)):
-            state_values[i] = np.max(state_values[i])
-        if state_obs_keys is not None:
-            for i in range(len(train_data_path_obs)):
-                _state_values = [state_obs[i][key] for key in state_obs_keys]
-                state_obs_values.append(_state_values)
-            for i in range(len(train_data_path_obs)):
-                for j in range(len(state_obs_keys)):
-                    state_obs_values[i][j] = np.max(state_obs_values[i][j])
-        mode = 'w' if iteration == 0 else 'a'
-        if validation is not None:
-            state_keys += ['le_val', 'lf_val']
-            state_values += validation
-        with open(progress_path, mode) as file:
-            if iteration == 0:
-                file.write('  '.join(f'{key:>12}' for key in state_keys))
-                if state_obs_keys is not None:
-                    if len(train_data_path_obs) > 1:
-                        file.write('   ' + '  '.join(f'{key}_{temperature[poss]}K' for poss in range(len(train_data_path_obs)) for key in state_obs_keys) + '\n')
-                    else:
-                        file.write('   ' + '  '.join(f'{key:>12}' for key in state_obs_keys) + '\n')
-            iter_str = f'{int(state_values[0]):>12}  '
-            loss_str = '  '.join(f'{value:>12.4e}' for value in state_values[1:])
-            if state_obs_keys is not None:
-                obs_str = '  '.join(f'{value:>12.4e}' for i in range(len(train_data_path_obs)) for value in state_obs_values[i])
+        
+    # define print step
+    def print_step():
+        beta_smoothing = print_loss_smoothing * (1 - (1-1/print_loss_smoothing)**(iteration+1))
+        line = f'Iter {iteration:7d}'
+        line += f' L {(state["loss_avg"] / beta_smoothing) ** 0.5:7.5f}'
+        if model_type != 'atomic':
+            line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
+            line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
+        if model_type == 'observables':
+            line += f' LOBS {(state_obs["lobs_avg"]):7.5f}'
+            line += f' OBS_REW {(state_obs["obs_term_avg"]):7.5f}'
+            line += f' OBS {(state_obs["obs_mean"]):7.5f}'
+            line += f' ESS {(state_obs["ESS"]):7.5f}'
+        if use_val_data:
+            if model_type != 'atomic':
+                line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
+                line += f' LFval {np.array([l[1] for l in loss_val]).mean() ** 0.5:7.5f}'
             else:
-                obs_str = ''
-            file.write(iter_str + loss_str + obs_str + '\n')
-    
+                line += f' Lval {np.array(loss_val).mean() ** 0.5:7.5f}'
+        line += f' Time {time.time() - tic:.2f}s'
+        print(line)
+
     # training loop
     tic = time.time()
     for iteration in range(int(step+1)):
-        # print progress
         if use_val_data and iteration % print_every == 0:
             val_batch = get_batch_val()
             loss_val = []
@@ -432,15 +420,6 @@ def train(
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                              'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
-            validation = [sum(col) / len(col) for col in zip(*loss_val)]
-        if iteration % print_every == 0:
-            if model_type == 'observables':
-                if use_val_data:
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ['lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'], validation)
-                else:
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'], ['lobs_avg', 'obs_term_avg', 'obs_mean', 'ESS'])
-            else:
-                    print_progress(['iteration', 'loss_avg', 'le_avg', 'lf_avg'])
 
         # training step part 1: energy and force
         batch, type_count, lattice_args = get_batch_train()
@@ -456,7 +435,7 @@ def train(
         if model_type == 'observables' and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(train_data_path_obs)):
-                batch, type_count, lattice_args = get_batch_train(observable_step=True, possition=i)
+                batch, type_count, lattice_args = get_batch_train(observable_step=True, obs_position=i)
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                             'lattice': lattice_args})
                 variables, opt_state, state, state_obs = train_step(batch,
@@ -466,7 +445,11 @@ def train(
                                                         state_obs,
                                                         static_args,
                                                         observable_step=True,
-                                                        possition=i) 
+                                                        obs_position=i) 
+
+        if iteration % print_every == 0:
+            print_step()
+            tic = time.time()
 
     # compress, save, and finish
     if compress:
