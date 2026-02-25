@@ -5,14 +5,12 @@ import jax.numpy as jnp
 import time, datetime
 import flax.linen as nn
 from functools import partial
-from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset, distribution_plot
+from .utils import get_p3mlr_fn, get_p3mlr_grid_size, load_model, save_model, compress_model, save_dataset
 from .data import DPDataset
 from .dpmodel import DPModel
 from typing import Union, List
 import tempfile
 import os
-from matplotlib.cm import get_cmap
-from matplotlib.colors import LinearSegmentedColormap
 
 def train(
     model_type: str,
@@ -22,10 +20,6 @@ def train(
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
     progress_path: str = 'progress.out',
-    distribution_path: str = 'distribution.out',
-    plot_path: str = 'distribution.png',
-    print_distribution: bool = False,
-    plot_distribution: bool = False,
     step: int = 1000000,
     obs_step_every: int = 1,
     mp: bool = False,
@@ -34,14 +28,13 @@ def train(
     embed_mp_widths: List[int] = [64,64,64],
     fit_widths: List[int] = None,
     axis_neurons: int=12,
-    lr: float = None, #0.002 for energy, 0.01 for atomic
+    lr: float = None,
     batch_size: int = None,
     val_batch_size_ratio: int = 4,
     batch_size_observable: int = 8,
     batch_size_ess: int = 8,
     compress: bool = True,
     print_every: int = 1000,
-    plot_every: int = 100000,  #Just for observables
     atomic_data_prefix: str = 'atomic_dipole',
     s_pref_e: float = 0.02,
     l_pref_e: float = 1,
@@ -77,7 +70,6 @@ def train(
             progress_path: path to save variables from the training progress.
             train_data: path to training data (str) or list of paths to training data (List[str]).
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
-            ess_data: path to data for computing effective sample size (str) or list of paths to such data (List[str]).
             step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
             mp: whether to use message passing model for more accuracy at a higher cost.
             atomic_sel: Selects the atom types for prediction. Only used when model_type == 'atomic'.
@@ -111,9 +103,6 @@ def train(
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
 
         Observables model specific input arguments:
-            distribution_path: path to save the final values of the observable and weights for each configuration (only used when print_distribution = True).
-            plot_path: path to save the on-the-fly observable distribution plot (only used when print_plot = True).
-            plot_every: interval for updating the observable distribution plot (only used when print_plot = True).
             batch_size_observable: training batch size for observable loss in number of frames.
             s_pref_obs: starting prefactor for observable loss.
             l_pref_obs: limit prefactor for observable loss.
@@ -158,7 +147,7 @@ def train(
     elif model_type == 'atomic':
         labels = ['coord', 'box', atomic_data_prefix]
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
-    elif model_type == 'observables':   #New model type for observables
+    elif model_type == 'observables':   # Model type for hybrid ab initio and empirical models
         labels = ['coord', 'box', 'energy', 'force']
     else:
         raise ValueError('model_type should be "energy", "atomic", or "dplr".')
@@ -247,7 +236,7 @@ def train(
         'use_2nd': tensor_2nd,
         'use_mp': mp,
         'atomic': model_type == 'atomic',
-        'observables': model_type == 'observables', #Observables model type
+        'observables': model_type == 'observables', # Model type is hybrid ab initio and empirical
         'nsel': atomic_sel if model_type == 'atomic' else None,
         'out_norm': 1. if model_type != 'atomic' else train_data.get_atomic_label_scale(),
         **train_data.get_stats(rcut, getstat_bs),
@@ -431,23 +420,6 @@ def train(
                 obs_str = ''
             file.write(iter_str + loss_str + obs_str + '\n')
     
-    def print_distr():
-        obs_total = []
-        logweights_fullset = []
-        for i in range(int(train_data_obs.nframes/batch_size_observable)):
-            _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
-            obs = _batch['observable'].reshape(len(_batch['energy']), -1)
-            obs_total = np.append(obs_total, np.max(obs, axis=1))
-            pred_logweights = weights(variables, _batch, static_args)
-            logweights_fullset = np.append(logweights_fullset, pred_logweights)
-        logweights_fullset -= logweights_fullset.max()
-        weights_fullset = np.exp(logweights_fullset)
-        table = np.column_stack((obs_total, weights_fullset))
-        with open(distribution_path, 'w') as f:
-            f.write('Observable  Weight\n')
-            for line in table:
-                f.write(f'{line[0]:.5f} {line[1]:.5e}\n')
-    
     # training loop
     tic = time.time()
     for iteration in range(int(step+1)):
@@ -496,40 +468,12 @@ def train(
                                                         observable_step=True,
                                                         possition=i) 
 
-            # plot observable distribution
-            #if plot_distribution and iteration % plot_every == 0:
-            #    if iteration == 0:
-            #        fig = distribution_plot()
-            #        fig.reference(train_data_obs.subsets[0].data['observable'], label='Reference')
-            #        colors = ["yellow", "orange", "red"]
-            #        cmap = LinearSegmentedColormap.from_list("my_colormap", colors)
-            #        #cmap = get_cmap('Greens')
-            #        color_grad = iter([cmap(i) for i in np.linspace(0., 1., int(step/plot_every))])
-            #    else:
-            #        obs_fullset = []
-            #        logweights_fullset = []
-            #        for i in range(int(train_data_obs.nframes/batch_size_observable)):
-            #            _batch, _, _ = train_data_obs.get_batch(batch_size_observable)
-            #            obs_fullset = np.append(obs_fullset, _batch['observable'])
-            #            pred_logweights = weights(variables, _batch, static_args)
-            #            logweights_fullset = np.append(logweights_fullset, pred_logweights)
-           #         logweights_fullset -= logweights_fullset.max()
-           #         weights_fullset = np.exp(logweights_fullset)
-           #         fig.add_histogram(obs_fullset, weights_fullset, label=f'Iteration {iteration:,}', color=next(color_grad))
-
-    #if plot_distribution: fig.savefig(plot_path)
-
-    # print observable distribution
-    #if model_type == 'observables' and print_distribution:
-    #    print('# Printing observable distribution to', distribution_path)
-    #    print_distr()
-
     # compress, save, and finish
     if compress:
-        model, variables = compress_model(model, 
-                                          variables, 
-                                          compress_Ngrids, 
-                                          compress_r_min)
+        model, variables = compress_model(model,
+                                                variables,
+                                                compress_Ngrids,
+                                                compress_r_min)
     save_model(save_path, model, variables)
     print(f'# Training finished in {datetime.timedelta(seconds=int(time.time() - TIC))}.')
 

@@ -5,6 +5,7 @@ from setuptools.command.install import install
 
 setup(
     name='deepmd_jax',
+    version='0.2',
     packages=find_packages(),
     install_requires=[
         'jax[cuda12]>=0.7.1',
@@ -15,10 +16,10 @@ setup(
         'matplotlib',
         'gpustat',
         'ipykernel',
-        'seaborn',
-        'pandas',
     ],
+    author='Ruiqi Gao',
+    author_email='ruiqigao@princeton.edu',
     description='DP-JAX',
-    url='https://github.com/AMLS-PRG/deepmd-jax',
+    url='https://github.com/SparkyTruck/deepmd-jax',
     python_requires='>=3.10',
 )
