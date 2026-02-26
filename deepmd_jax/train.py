@@ -19,7 +19,6 @@ def train(
     train_data_path_obs: Union[str, List[str], List[List[str]]] = None,
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
-    progress_path: str = 'progress.out',
     step: int = 1000000,
     obs_step_every: int = 1,
     mp: bool = False,
@@ -31,8 +30,6 @@ def train(
     lr: float = None,
     batch_size: int = None,
     val_batch_size_ratio: int = 4,
-    batch_size_observable: int = 8,
-    batch_size_ess: int = 8,
     compress: bool = True,
     print_every: int = 1000,
     atomic_data_prefix: str = 'atomic_dipole',
@@ -40,8 +37,6 @@ def train(
     l_pref_e: float = 1,
     s_pref_f: float = 1000,
     l_pref_f: float = 1,
-    s_pref_obs: float = 0.005,
-    l_pref_obs: float = 0.1,
     dplr_wannier_model_path: str = None,
     dplr_q_atoms: List[float] = None,
     dplr_q_wc: List[float] = None,
@@ -57,6 +52,10 @@ def train(
     compress_Ngrids: int = 1024,
     compress_r_min: float = 0.6,
     seed: int = None,
+    hybrid: bool = False,
+    s_pref_obs: float = 0.005,
+    l_pref_obs: float = 0.1,
+    batch_size_observable: int = 8,
     temperature: Union[float, list] = None,
     target_observable: Union[float, str, list, None] = None,
 ):
@@ -67,7 +66,6 @@ def train(
             model_type: 'energy' (force field), 'atomic' (e,g. Deep Wannier), 'dplr' (long-range)
             rcut: cutoff radius (Angstrom) for the model.
             save_path: path to save the trained model.
-            progress_path: path to save variables from the training progress.
             train_data: path to training data (str) or list of paths to training data (List[str]).
             val_data: path to validation data (str) or list of paths to validation data (List[str]).
             step: number of training steps. Depending on dataset size, expect 1e5-1e7 for energy models and 1e5-1e6 for wannier models.
@@ -101,8 +99,8 @@ def train(
             print_loss_smoothing: smoothing factor for loss printing.
             compress_Ngrids: Number of intervals used in compression.
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
-
-        Observables model specific input arguments:
+        Input arguments specific for hybrid ab initio and empirical models:
+            hybrid: whether to train hybrid ab initio and empirical models.
             batch_size_observable: training batch size for observable loss in number of frames.
             s_pref_obs: starting prefactor for observable loss.
             l_pref_obs: limit prefactor for observable loss.
@@ -147,8 +145,6 @@ def train(
     elif model_type == 'atomic':
         labels = ['coord', 'box', atomic_data_prefix]
         assert type(atomic_sel) == list, ' Must provide atomic_sel properly for model_type "atomic".'
-    elif model_type == 'observables':   # Model type for hybrid ab initio and empirical models
-        labels = ['coord', 'box', 'energy', 'force']
     else:
         raise ValueError('model_type should be "energy", "atomic", or "dplr".')
     if type(train_data_path) == str:
@@ -159,8 +155,10 @@ def train(
                            labels,
                            {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
-    if model_type == 'observables':
-        # Multiple temperatures (quick and dirty implementation)
+    if hybrid:
+        if model_type != 'energy':
+            raise ValueError('For hybrid models model_type has to be energy')
+        # Multiple temperatures
         labels_obs = labels + ['observable']
         labels_obs = [item for item in labels_obs if item != 'force']
         if type(temperature) == list:
@@ -173,7 +171,8 @@ def train(
                 single_data_obs.compute_lattice_candidate(rcut)
                 train_data_obs.append(single_data_obs)
         else:
-            if train_data_path_obs is None: print('# Error: Must provide train_data_path_obs for model_type "observables".')
+            if train_data_path_obs is None:
+                raise ValueError('Must provide train_data_path_obs for hybrid models.')
             elif type(train_data_path_obs) == str:
                 train_data_path_obs = [train_data_path_obs]
             else:
@@ -236,7 +235,7 @@ def train(
         'use_2nd': tensor_2nd,
         'use_mp': mp,
         'atomic': model_type == 'atomic',
-        'observables': model_type == 'observables', # Model type is hybrid ab initio and empirical
+        'hybrid': hybrid, 
         'nsel': atomic_sel if model_type == 'atomic' else None,
         'out_norm': 1. if model_type != 'atomic' else train_data.get_atomic_label_scale(),
         **train_data.get_stats(rcut, getstat_bs),
@@ -286,8 +285,8 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
-    if target_observable is None and model_type == 'observables':
-        raise ValueError('Must provide target_observable for model_type "observables".')
+    if target_observable is None and hybrid:
+        raise ValueError('Must provide target_observable for hybrid models')
     if isinstance(target_observable, (int, float)):
         target_observable = [target_observable]
     elif isinstance(target_observable, str):
@@ -298,22 +297,22 @@ def train(
     if isinstance(temperature, (int, float)):
         temperature = [temperature]
 
-    loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
-    weights = model.get_weights()
+    if hybrid:
+        loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
+
     state_obs = {}
-    if model_type == 'observables':
-        state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
-        _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
-        state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
-    elif model_type != 'atomic':
+    if model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
+    if hybrid:
+        _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
+        state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
     
     @partial(jax.jit, static_argnames=('static_args', 'observable_step', 'obs_position'))
     def train_step(batch, variables, opt_state, state, state_obs, static_args, observable_step=False, obs_position=0):
         r = lr_scheduler(state['iteration']) / lr
-        if observable_step:
+        if hybrid and observable_step:
             pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
             (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
                                                                                                 batch,
@@ -368,7 +367,7 @@ def train(
         print(f'# Auto batch size = int({label_bs}/nlabels_per_frame)')
     else:
         print(f'# Batch size = {batch_size}')
-    if model_type == 'observables':
+    if hybrid:
         print(f'# Observable loss batch size = {batch_size_observable}')
     def get_batch_train(observable_step=False, obs_position=0):
         if not observable_step:
@@ -395,7 +394,7 @@ def train(
         if model_type != 'atomic':
             line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
             line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
-        if model_type == 'observables':
+        if hybrid:
             for obs_position in range(len(train_data_path_obs)):
                 line += f' LOBS{obs_position} {float(state_obs[obs_position]["lobs_avg"]):7.5f}'
                 line += f' ESS{obs_position} {float(state_obs[obs_position]["ESS"]):7.5f}'
@@ -434,7 +433,7 @@ def train(
                                                  state_obs,
                                                  static_args)
         # training step part 2: observables
-        if model_type == 'observables' and iteration % obs_step_every == 0:
+        if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(train_data_path_obs)):
                 batch, type_count, lattice_args = get_batch_train(observable_step=True, obs_position=i)
