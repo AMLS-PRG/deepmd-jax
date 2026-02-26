@@ -396,10 +396,12 @@ def train(
             line += f' LE {(state["le_avg"] / beta_smoothing) ** 0.5:7.5f}'
             line += f' LF {(state["lf_avg"] / beta_smoothing) ** 0.5:7.5f}'
         if model_type == 'observables':
-            line += f' LOBS {(state_obs["lobs_avg"]):7.5f}'
-            line += f' OBS_REW {(state_obs["obs_term_avg"]):7.5f}'
-            line += f' OBS {(state_obs["obs_mean"]):7.5f}'
-            line += f' ESS {(state_obs["ESS"]):7.5f}'
+            for obs_position in range(len(train_data_path_obs)):
+                line += f' LOBS{obs_position} {float(state_obs[obs_position]["lobs_avg"]):7.5f}'
+                line += f' ESS{obs_position} {float(state_obs[obs_position]["ESS"]):7.5f}'
+                for obs_item  in range(len(state_obs[obs_position]["obs_term_avg"])):
+                    line += f' OBS_REW_{obs_position}_{obs_item} {float(state_obs[obs_position]["obs_term_avg"][obs_item]):7.5f}'
+                    line += f' OBS_{obs_position}_{obs_item} {float(state_obs[obs_position]["obs_mean"][obs_item]):7.5f}'
         if use_val_data:
             if model_type != 'atomic':
                 line += f' LEval {np.array([l[0] for l in loss_val]).mean() ** 0.5:7.5f}'
