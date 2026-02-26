@@ -129,20 +129,9 @@ class DPModel(nn.Module):
             observable = batch_data['observable']
             if len(observable.shape) == 1:
                 observable = observable[:, None]  # ensure observable is 2D
-            obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable expected value from data
+            obs_avg = jnp.sum(observable * weights[:, None], axis=0) / jnp.sum(weights) # observable reweighted expectation value
             lobs = jnp.mean((obs_avg - target_observable)**2)
             return pref['obs']*lobs, (lobs, obs_avg, observable, logweights)
         loss_and_grad = value_and_grad(loss_obs, has_aux=True)
         return loss_obs, loss_and_grad
-    
-    def get_weights(self):
-        vmap_energy = vmap(self.energy, (None, 0, 0, None))
-        def weights(variables, batch_data, static_args, temperature):
-            e = vmap_energy(variables, batch_data['coord'], batch_data['box'], static_args)
-            kb = 8.617333262e-5
-            beta = 1 / (kb * temperature)
-            logweights = - beta * (e - batch_data['energy'])
-            #logweights -= jnp.amax(logweights)
-            #weights = jnp.exp(logweights)
-            return logweights
-        return weights
+
