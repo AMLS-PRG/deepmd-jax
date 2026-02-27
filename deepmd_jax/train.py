@@ -303,17 +303,17 @@ def train(
     if hybrid:
         loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
 
-    state_obs = {}
     if model_type != 'atomic':
         state = {'loss_avg': 0., 'le_avg': 0., 'lf_avg': 0., 'iteration': 0}
     else:
         state = {'loss_avg': 0., 'iteration': 0}
     if hybrid:
+        state_obs = {}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
         state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
 
-    @partial(jax.jit, static_argnames=('static_args'))
-    def train_step(batch, variables, opt_state, state, state_obs, static_args):
+    @partial(jax.jit, static_argnames=('static_args',))
+    def train_step(batch, variables, opt_state, state, static_args):
         r = lr_scheduler(state['iteration']) / lr
         if model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
