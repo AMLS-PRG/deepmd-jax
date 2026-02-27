@@ -70,6 +70,25 @@ train(
 )
 ```
 
+#### Training a hybrid ab initio and empirical model:
+```python
+train(
+      model_type='energy',                   # Model type
+      hybrid=True,                           # Set hybrid to true
+      rcut = 6.0,                            # Cutoff radius
+      save_path = 'model.pkl',               # Path to save the trained model
+      train_data_path='/energy/force/data/', # Path (or a list of paths) to the training dataset
+      step=1000000,                          # Number of training steps
+      train_data_path_obs = '/hybrid/data',  # Path (or a list of paths) with observable dataset 
+      temperature = 320,                     # Temperature in Kelvin corresponding to observable dataset
+      target_observable = 1.0,               # Target (empirical) value of the observable
+      batch_size_observable = 100,           # Batch size for observable loss. Usually >> 1 to allow reweighting
+      s_pref_obs = 0.02,                     # Starting value of prefactor in the observable loss term
+      l_pref_obs = 100,                      # Last value of prefactor in the observable loss term
+)
+```
+
+
 The default values for the other arguments in [`train()`](https://github.com/SparkyTruck/deepmd-jax/blob/main/deepmd_jax/train.py) like learning rate, batch size, model width, etc. are usually a solid baseline. The one parameter you may want to change is `mp=True` to enable DP-MP for better accuracy.
 
 ### Evaluating a Model
