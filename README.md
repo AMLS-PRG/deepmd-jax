@@ -7,6 +7,7 @@ DeepMD-jax supports:
 - **Deep Potential (DP)**: Fast energy and force predictions.
 - **Deep Wannier (DW)**: Predicting Wannier centers associated to atoms.
 - **DP Long Range (DPLR)**: Incorporate explicit long-range Coulomb interactions.
+- **Hybrid ab initio and empirical DP**: Incorporate empirical data during training ([link to article](https://arxiv.org/abs/2511.14352)).
 
 Also, you can try the [**DP-MP**](https://pubs.rsc.org/en/content/articlehtml/2024/cp/d4cp01483a) architecture for enhanced accuracy.
 
