@@ -16,11 +16,9 @@ def train(
     model_type: str,
     rcut: float,
     train_data_path: Union[str, List[str]],
-    train_data_path_obs: Union[str, List[str], List[List[str]]] = None,
     val_data_path: Union[str, List[str]] = None,
     save_path: str = 'model.pkl',
     step: int = 1000000,
-    obs_step_every: int = 1,
     mp: bool = False,
     atomic_sel: List[int] = None,
     embed_widths: List[int] = [32,32,64],
@@ -55,9 +53,11 @@ def train(
     hybrid: bool = False,
     s_pref_obs: float = 0.005,
     l_pref_obs: float = 0.1,
+    train_data_path_obs: Union[str, List[str], List[List[str]]] = None,
     batch_size_observable: int = 8,
     temperature: Union[float, list] = None,
     target_observable: Union[float, str, list, None] = None,
+    obs_step_every: int = 1,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -101,11 +101,13 @@ def train(
             compress_r_min: A safe lower bound for interatomic distance in the compressed model.
         Input arguments specific for hybrid ab initio and empirical models:
             hybrid: whether to train hybrid ab initio and empirical models.
+            train_data_path_obs: paths to training data with trajectories with observable values.
             batch_size_observable: training batch size for observable loss in number of frames.
             s_pref_obs: starting prefactor for observable loss.
             l_pref_obs: limit prefactor for observable loss.
             temperature: Temperature of the system (K). Used in the reweighting of observables.
             target_observable: Target value of the observable to be learned. Can be a float or a path to a .npy file containing (single or multiple) values for each configuration in different lines.
+            obs_step_every: evaluate and optimize observable loss function every this many steps.
     '''
     
     TIC = time.time()
@@ -155,6 +157,8 @@ def train(
                            labels,
                            {'atomic_sel':atomic_sel})
     train_data.compute_lattice_candidate(rcut)
+
+    # Setup for hybrid training
     if hybrid:
         if model_type != 'energy':
             raise ValueError('For hybrid models model_type has to be energy')
@@ -182,6 +186,17 @@ def train(
                                        {'atomic_sel':atomic_sel})
             train_data_obs.compute_lattice_candidate(rcut)
             train_data_obs = [train_data_obs]
+        if target_observable is None and hybrid:
+            raise ValueError('Must provide target_observable for hybrid models')
+        if isinstance(target_observable, (int, float)):
+            target_observable = [target_observable]
+        elif isinstance(target_observable, str):
+            target_observable = [np.load(target_observable)]
+        elif isinstance(target_observable, list) and isinstance(target_observable[0], str):
+            target_observable = [np.load(path) for path in target_observable]
+        if isinstance(temperature, (int, float)):
+            temperature = [temperature]
+
     use_val_data = val_data_path is not None
     if use_val_data:
         if type(val_data_path) == str:
@@ -285,18 +300,6 @@ def train(
 
     # define training step
     loss_fn, loss_and_grad_fn = model.get_loss_fn()
-    if target_observable is None and hybrid:
-        raise ValueError('Must provide target_observable for hybrid models')
-    if isinstance(target_observable, (int, float)):
-        target_observable = [target_observable]
-    elif isinstance(target_observable, str):
-        target_observable = [np.load(target_observable)]
-    elif isinstance(target_observable, list) and isinstance(target_observable[0], str):
-        target_observable = [np.load(path) for path in target_observable]
-
-    if isinstance(temperature, (int, float)):
-        temperature = [temperature]
-
     if hybrid:
         loss_obs, loss_and_grad_obs = model.get_observable_loss_fn()
 
@@ -308,25 +311,11 @@ def train(
     if hybrid:
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
         state_obs = {k: _single_state_obs for k in range(len(train_data_path_obs))}
-    
-    @partial(jax.jit, static_argnames=('static_args', 'observable_step', 'obs_position'))
-    def train_step(batch, variables, opt_state, state, state_obs, static_args, observable_step=False, obs_position=0):
+
+    @partial(jax.jit, static_argnames=('static_args'))
+    def train_step(batch, variables, opt_state, state, state_obs, static_args):
         r = lr_scheduler(state['iteration']) / lr
-        if hybrid and observable_step:
-            pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
-            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
-                                                                                                batch,
-                                                                                                pref,
-                                                                                                static_args,
-                                                                                                temperature[obs_position],
-                                                                                                target_observable[obs_position])
-            state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
-            state_obs[obs_position]['obs_term_avg'] = obs_avg
-            state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
-            state_obs[obs_position]['logweights'] = logweights
-            weights = jnp.exp(logweights)
-            state_obs[obs_position]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
-        elif model_type != 'atomic':
+        if model_type != 'atomic':
             pref = {'e': s_pref_e*r + l_pref_e*(1-r),
                     'f': s_pref_f*r + l_pref_f*(1-r)}
             (loss_total, (loss_e, loss_f)), grads = loss_and_grad_fn(variables,
@@ -343,8 +332,28 @@ def train(
             state['loss_avg'] = state['loss_avg'] * (1-1/print_loss_smoothing) + loss_total
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
-        if not observable_step: state['iteration'] += 1
-        return variables, opt_state, state, state_obs
+        state['iteration'] += 1
+        return variables, opt_state, state
+    
+    @partial(jax.jit, static_argnames=('static_args', 'obs_position'))
+    def train_step_obs(batch, variables, opt_state, state_obs, static_args, obs_position=0):
+        r = lr_scheduler(state['iteration']) / lr
+        pref = {'obs': s_pref_obs*r + l_pref_obs*(1-r)}
+        (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
+                                                                                            batch,
+                                                                                            pref,
+                                                                                            static_args,
+                                                                                            temperature[obs_position],
+                                                                                            target_observable[obs_position])
+        state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
+        state_obs[obs_position]['obs_term_avg'] = obs_avg
+        state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
+        state_obs[obs_position]['logweights'] = logweights
+        weights = jnp.exp(logweights)
+        state_obs[obs_position]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+        updates, opt_state = optimizer.update(grads, opt_state, variables)
+        variables = optax.apply_updates(variables, updates)
+        return variables, opt_state, state_obs
     
     # define validation step
     @partial(jax.jit, static_argnames=('static_args',))
@@ -369,14 +378,13 @@ def train(
         print(f'# Batch size = {batch_size}')
     if hybrid:
         print(f'# Observable loss batch size = {batch_size_observable}')
-    def get_batch_train(observable_step=False, obs_position=0):
-        if not observable_step:
-            if batch_size is None:
-                return train_data.get_batch(label_bs, 'label')
-            else:
-                return train_data.get_batch(batch_size)
+    def get_batch_train():
+        if batch_size is None:
+            return train_data.get_batch(label_bs, 'label')
         else:
-            return train_data_obs[obs_position].get_batch(batch_size_observable)
+            return train_data.get_batch(batch_size)
+    def get_batch_train_obs(obs_position=0):
+        return train_data_obs[obs_position].get_batch(batch_size_observable)
     def get_batch_val():
         ret = []
         for _ in range(val_batch_size_ratio):
@@ -426,26 +434,23 @@ def train(
         batch, type_count, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                      'lattice': lattice_args})
-        variables, opt_state, state, _ = train_step(batch,
+        variables, opt_state, state = train_step(batch,
                                                  variables,
                                                  opt_state,
                                                  state,
-                                                 state_obs,
                                                  static_args)
         # training step part 2: observables
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(train_data_path_obs)):
-                batch, type_count, lattice_args = get_batch_train(observable_step=True, obs_position=i)
+                batch, type_count, lattice_args = get_batch_train_obs(obs_position=i)
                 static_args = nn.FrozenDict({'type_count': tuple(type_count),
                                             'lattice': lattice_args})
-                variables, opt_state, state, state_obs = train_step(batch,
+                variables, opt_state, state_obs = train_step_obs(batch,
                                                         variables,
                                                         opt_state,
-                                                        state,
                                                         state_obs,
                                                         static_args,
-                                                        observable_step=True,
                                                         obs_position=i) 
 
         if iteration % print_every == 0:
