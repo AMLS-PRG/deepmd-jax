@@ -1,7 +1,4 @@
-import subprocess
-from setuptools import setup, find_packages
-from setuptools.command.develop import develop
-from setuptools.command.install import install
+from setuptools import find_packages, setup
 
 setup(
     name='deepmd_jax',
@@ -11,7 +8,7 @@ setup(
         'jax[cuda12]>=0.7.1',
         'flax',
         'optax',
-        'jax-md @ git+https://github.com/google/jax-md.git',
+        'jax-md>=0.2.27',
         'ase',
         'matplotlib',
         'gpustat',
