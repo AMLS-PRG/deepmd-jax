@@ -92,12 +92,16 @@ class DPModel(nn.Module):
                 pred = pred[:, [0,4,3,4,1,5,3,5,2]] * jnp.array([1,s,s,s,1,s,s,s,1])
             debug = T_NselYW
         if not self.params['atomic']:
-            debug = T_NselXW
+            debug = G_NselAW
         return pred * self.params['out_norm'], debug
 
     def energy(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         pred, _ = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
         return pred
+
+    def descriptors(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
+        _, descr = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
+        return descr
 
     def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
         (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_nm)

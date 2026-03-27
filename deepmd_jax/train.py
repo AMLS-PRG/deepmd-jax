@@ -680,7 +680,65 @@ def evaluate(
         _, _, _, predictions, _ = test(model_path, temp_dir, batch_size)
 
     return predictions
+
+
+def evaluate_descriptors(
+    model_path: str,
+    data_path: str,
+    batch_size: int = 1,
+):
+    '''
+        Evaluate descriptors of a trained model on a **single** dataset.
+        Input arguments:
+            model_path: path to the trained model.
+            data_path: path to the data for evaluation.
+            batch_size: Increase for potentially faster evaluation, but requires more memory.
+    '''
+    if type(data_path) == list:
+        raise ValueError('Data_path should be a single string path for now.')
+
+    if jax.device_count() > 1:
+        print('# Note: Currently only one device will be used for evaluation.')
     
+    model, variables = load_model(model_path, replicate=False)
+    if model.params['type'] == 'energy' or model.params['type'] == 'dplr':
+        labels = ['coord', 'box', 'force', 'energy']
+        atomic_sel = None
+    elif model.params['type'] == 'atomic':
+        labels = ['coord', 'box', model.params['atomic_data_prefix']]
+        atomic_sel = model.params['nsel']
+    else:
+        raise ValueError('Model type should be "energy", "atomic", or "dplr".')
+    test_data = DPDataset([data_path],
+                          labels,
+                          {'atomic_sel':atomic_sel})
+    test_data.compute_lattice_candidate(model.params['rcut'])
+    if 'dplr' in model.params['type']:
+        subsets = test_data.get_flattened_data()
+        for subset in subsets:
+            process_long_range_subset(subset,
+                                      model.params['dplr_q_atoms'],
+                                      model.params['dplr_q_wc'],
+                                      model.params['dplr_beta'],
+                                      model.params['dplr_resolution'],
+                                      *model.params['dplr_wannier_model_and_variables'])
+    test_data.pointer = 0
+    remaining = test_data.nframes
+    evaluate_fn = model.descriptors
+    evaluate_fn = jax.jit(jax.vmap(evaluate_fn,
+                                   in_axes=(None,0,0,None)),
+                                   static_argnames=('static_args',))
+    descriptors = []
+    while remaining > 0:
+        bs = min(batch_size, remaining)
+        batch, type_count, lattice_args = test_data.get_batch(bs)
+        remaining -= bs
+        static_args = nn.FrozenDict({'type_count': type_count, 'lattice': lattice_args})
+        descr = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
+        descriptors.append(descr[0])
+    return descriptors
+
+
 def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_resolution, wc_model, wc_variables):
     '''
         subtracting long range energy and force, keeping short range part only, for dplr models.

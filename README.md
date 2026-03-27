@@ -168,6 +168,14 @@ dyn.run(10)  # 10 MD steps
 
 The ASE calculator may run slower than the built-in `Simulation`, but you can take advantage of the rich ASE features, such as minimization routines, different thermostats, non-isotropic NPT simulations, etc.
 
+### Evaluating descriptors
+
+Use `evaluate_descriptors()` on a dataset:
+```python
+from deepmd_jax.train import evaluate_descriptors
+descriptors = evaluate_descriptors(model_path, data_path)
+```
+
 ### Precision Settings
 
 By default, single precision `float32` is used for both training and simulation, which I find to be generally sufficient. However, if you need double precision, enable it at the **beginning** of your script with:
