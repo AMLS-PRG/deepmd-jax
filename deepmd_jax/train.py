@@ -360,6 +360,9 @@ def train(
         state_obs = {}
         _single_state_obs = {'lobs_avg': 0., 'obs_term_avg': 0., 'obs_mean': 0., 'logweights': [0.], 'ESS': 1. }
         state_obs = {k: _single_state_obs for k in range(len(obs_train_data_path))}
+        cached_obs_grads = {}  # per-obs-position grad cache
+        obs_order = list(range(len(obs_train_data_path)))  # for random cycling
+        obs_cycle_iter = iter([])  # exhausted iterator to trigger reshuffle on first step
 
     @partial(jax.jit, static_argnames=('static_args',))
     def train_step(batch, variables, opt_state, state, static_args):
@@ -384,26 +387,29 @@ def train(
         state['iteration'] += 1
         return variables, opt_state, state
     
-    @partial(jax.jit, static_argnames=('static_args', 'obs_position'))
-    def train_step_obs(batch, variables, opt_state, state_obs, static_args, obs_position=0):
-        r = lr_scheduler(state['iteration']) / lr
-        pref = {'obs': obs_s_pref*r + obs_l_pref*(1-r)}
-        (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
-                                                                                            batch,
-                                                                                            pref,
-                                                                                            static_args,
-                                                                                            obs_temperature[obs_position],
-                                                                                            obs_target[obs_position])
-        state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
-        state_obs[obs_position]['obs_term_avg'] = obs_avg
-        state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
-        state_obs[obs_position]['logweights'] = logweights
-        weights = jnp.exp(logweights)
-        state_obs[obs_position]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+    @partial(jax.jit, static_argnames=('static_args', 'obs_position', 'use_cached_gradients'))
+    def train_step_obs(batch, variables, opt_state, state_obs, static_args, obs_position=0, use_cached_gradients=False):
+        if not use_cached_gradients:
+            r = lr_scheduler(state['iteration']) / lr
+            pref = {'obs': obs_s_pref*r + obs_l_pref*(1-r)}
+            (loss_obs, (loss_obs_raw, obs_avg, obs_batch, logweights)), grads = loss_and_grad_obs(variables,
+                                                                                                batch,
+                                                                                                pref,
+                                                                                                static_args,
+                                                                                                obs_temperature[obs_position],
+                                                                                                obs_target[obs_position])
+            state_obs[obs_position]['lobs_avg'] = state_obs[obs_position]['lobs_avg'] * (1-1/print_loss_smoothing) + jnp.sqrt(loss_obs_raw) * 1/print_loss_smoothing
+            state_obs[obs_position]['obs_term_avg'] = obs_avg
+            state_obs[obs_position]['obs_mean'] = np.mean(obs_batch, axis=0)
+            state_obs[obs_position]['logweights'] = logweights
+            weights = jnp.exp(logweights)
+            state_obs[obs_position]['ESS'] = jnp.sum(weights)**2 / jnp.sum(weights ** 2)
+        else:
+            grads = cached_obs_grads[obs_position]
         updates, opt_state = optimizer.update(grads, opt_state, variables)
         variables = optax.apply_updates(variables, updates)
-        return variables, opt_state, state_obs
-    
+        return variables, opt_state, state_obs, grads
+
     # define validation step
     @partial(jax.jit, static_argnames=('static_args',))
     def val_step(batch, variables, static_args):
@@ -495,18 +501,30 @@ def train(
                                                  static_args)
         
         # training step part 2 in hybrid observable training
-        if hybrid and iteration % obs_step_every == 0:
-            # observable train step
-            for i in range(len(obs_train_data_path)):
-                batch, type_count, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'type_count': tuple(type_count),
-                                            'lattice': lattice_args})
-                variables, opt_state, state_obs = train_step_obs(batch,
-                                                        variables,
-                                                        opt_state,
-                                                        state_obs,
-                                                        static_args,
-                                                        obs_position=i) 
+        if hybrid:
+            try:
+                i = next(obs_cycle_iter)
+            except StopIteration:
+                np.random.shuffle(obs_order)
+                obs_cycle_iter = iter(obs_order)
+                i = next(obs_cycle_iter)
+
+            use_cached = (iteration % obs_step_every != 0) and (i in cached_obs_grads)
+            batch_obs, type_count_obs, lattice_args_obs = get_batch_train_obs(obs_position=i)
+            static_args_obs = nn.FrozenDict({'type_count': tuple(type_count_obs),
+                                            'lattice': lattice_args_obs})
+            variables, opt_state, state_obs, grads = train_step_obs(
+                batch_obs,
+                variables,
+                opt_state,
+                state_obs,
+                static_args_obs,
+                obs_position=i,
+                use_cached_gradients=use_cached,
+            )
+            if not use_cached:
+                cached_obs_grads[i] = grads
+
 
         if iteration % print_every == 0:
             print_step()
